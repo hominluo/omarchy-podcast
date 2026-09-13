@@ -11,6 +11,8 @@ before the client connects, and both need the library and queue.
 
 from . import opml  # noqa: F401  (registers its commands)
 from .artwork import ArtworkCache
+from .chapters import Chapters
+from .downloads import Downloads
 from .library import Library
 from .playback import Playback
 from .player import MpvClient
@@ -23,13 +25,15 @@ def attach(engine):
     engine.library = Library(engine)
     engine.queue = Queue(engine)
     engine.artwork = ArtworkCache(engine)
+    engine.chapters = Chapters(engine)
+    engine.downloads = Downloads(engine)
     engine.search = Search(engine)
     engine.mpv = MpvClient(engine)
     engine.playback = Playback(engine)
     engine.scheduler = Scheduler(engine)
     engine.housekeeping_hooks = []
     engine.subsystems = [
-        engine.library, engine.queue, engine.artwork, engine.search,
-        engine.playback, engine.mpv, engine.scheduler,
+        engine.library, engine.queue, engine.artwork, engine.chapters, engine.search,
+        engine.downloads, engine.playback, engine.mpv, engine.scheduler,
     ]
     return engine

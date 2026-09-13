@@ -482,7 +482,15 @@ def cmd_episodes(engine, client, podcastId, offset, limit, filter, sort):
 
 @protocol.command("episode-get", "Everything about one episode", episodeId=A(int))
 def cmd_episode_get(engine, client, episodeId):
-    return {"episode": models.episode_detail(_lib(engine).require_episode(episodeId))}
+    row = _lib(engine).require_episode(episodeId)
+    detail = models.episode_detail(row)
+    chapters = getattr(engine, "chapters", None)
+    if chapters is not None:
+        cached = chapters.cached(int(episodeId))
+        if cached is None and row["chapters_url"]:
+            chapters._maybe_fetch(int(episodeId))
+        detail["chapters"] = chapters.merge(int(episodeId), [], row["duration"]) if cached else []
+    return {"episode": detail}
 
 
 @protocol.command("episode-set-state", "Move episodes between inbox and archive",
