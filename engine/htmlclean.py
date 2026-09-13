@@ -38,6 +38,7 @@ class _Cleaner(HTMLParser):
         self.stack = []
         self.drop_depth = 0
         self.size = 0
+        self.text_size = 0
         self.truncated = False
 
     # ---- helpers -----------------------------------------------------------
@@ -62,7 +63,8 @@ class _Cleaner(HTMLParser):
         if tag in self.stack:
             while self.stack:
                 top = self.stack.pop()
-                self._emit("</%s>" % top)
+                if not top.startswith("_"):
+                    self._emit("</%s>" % top)
                 if top == tag:
                     break
 
@@ -145,12 +147,14 @@ class _Cleaner(HTMLParser):
         self.handle_starttag(tag, attrs)
 
     def handle_data(self, data):
-        if self.drop_depth:
+        if self.drop_depth or not data:
             return
-        if not data:
+        if self.truncated:
             return
         self._emit(html.escape(data, quote=False))
-        self.text.append(data)
+        self.text_size += len(data)
+        if self.text_size <= MAX_OUTPUT:
+            self.text.append(data)
 
     def finish(self):
         while self.stack:
@@ -166,6 +170,8 @@ def clean(raw):
     source = str(raw or "").strip()
     if source == "":
         return "", ""
+    if len(source) > MAX_OUTPUT:
+        source = source[:MAX_OUTPUT]
     if "<" not in source:
         text = _collapse(html.unescape(source))
         paragraphs = [html.escape(part.strip()) for part in re.split(r"\n\s*\n", html.unescape(source)) if part.strip()]

@@ -56,7 +56,11 @@ class Playback:
         self._retries = 0
         self._stall_handle = None
         self._expect_stop = False
+        self._loading_source = None
+        self._eof_retried_for = None
         self._base_speed = 1.0
+        self._volume = 100            # the user's volume, untouched by fades
+        self._volume_synced = False   # _on_connect has pushed _volume to this mpv
         self._voice_boost = False
         self._skip_silence = False
 
@@ -70,6 +74,7 @@ class Playback:
         self.mpv.on_disconnect = self._on_disconnect
         persisted = self.engine.state["player"]
         self._base_speed = _clamp_speed(persisted.get("speed", 1.0))
+        self._volume = max(0, min(100, int(persisted.get("volume", 100))))
         self._skip_silence = bool(persisted.get("skipSilence"))
         self._voice_boost = bool(persisted.get("voiceBoost"))
         self.engine.library.on_new_episodes = self._on_new_episodes
@@ -97,6 +102,7 @@ class Playback:
     async def _on_connect(self):
         """Fresh or inherited mpv. An inherited one (engine restart) tells us
         which episode it holds through user-data/podcast."""
+        self._volume_synced = False
         adopted = None
         try:
             adopted = await self.mpv.get_property("user-data/podcast")
@@ -104,16 +110,26 @@ class Playback:
             adopted = None
         if isinstance(adopted, dict) and adopted.get("episodeId") is not None:
             row = self.engine.library.episode_row(int(adopted["episodeId"]))
-            if row is not None:
+            holds_file = False
+            try:
+                holds_file = not await self.mpv.get_property("idle-active") and bool(await self.mpv.get_property("path"))
+            except MpvError:
+                holds_file = False
+            if row is not None and holds_file:
                 self.current_id = row["id"]
                 self.current_row = row
                 self.loaded = True
                 self.loading_id = None
+                self._loading_source = None
                 LOG.info("adopted running playback of episode %d", row["id"])
+            else:
+                # Stale marker from a finished or stopped file.
+                self.mpv.command_nowait("set_property", "user-data/podcast", None)
         try:
-            await self.mpv.set_property("volume", int(self.engine.state["player"].get("volume", 100)))
+            await self.mpv.set_property("volume", self._volume)
         except MpvError:
             pass
+        self._volume_synced = True
         await self._apply_audio_toggles()
         if self.loaded:
             await self._apply_speed()
@@ -121,6 +137,7 @@ class Playback:
         self.broadcast_player(force=True)
 
     def _on_disconnect(self):
+        self._volume_synced = False
         self.flush_position(force=True, action=True)
         self.loaded = False
         self.loading_id = None
@@ -144,8 +161,13 @@ class Playback:
             self.broadcast_now_playing()
         elif name == "chapter":
             self._schedule_broadcast()
-            if self.sleep["mode"] == "chapter" and self.loaded and value not in (None, self.sleep.get("chapter")):
-                self._sleep_fire()
+            if self.sleep["mode"] == "chapter" and self.loaded and value is not None:
+                if self.sleep.get("chapter") is None:
+                    # First chapter of a newly loaded file (or armed while one
+                    # was loading): sleep at the end of this one.
+                    self.sleep["chapter"] = value
+                elif value != self.sleep["chapter"]:
+                    self._sleep_fire()
         elif name == "paused-for-cache":
             self._schedule_broadcast()
             self._watch_stall(bool(value))
@@ -153,19 +175,33 @@ class Playback:
             if self.loaded:
                 self.flush_position(force=True, action=bool(value))
             self._schedule_broadcast()
-        elif name in ("speed", "volume", "mute", "idle-active", "core-idle", "seekable",
+        elif name == "idle-active":
+            # mpv dropped the file behind our back (MPRIS Stop, a failed
+            # load): nothing is loaded any more, whatever we believed.
+            if value is True and self.loaded and self.loading_id is None:
+                self.flush_position(force=True, action=True)
+                self.loaded = False
+                self.broadcast_player(force=True)
+            else:
+                self._schedule_broadcast()
+        elif name in ("speed", "volume", "mute", "core-idle", "seekable",
                       "user-data/skipsilence/enabled", "user-data/skipsilence/base_speed", "af", "cache-buffering-state"):
-            if name == "volume" and value is not None and not self._fading:
-                self.store.set_setting("volume", int(value))
-            if name == "user-data/skipsilence/base_speed" and value:
-                self._base_speed = _clamp_speed(value)
+            # A fresh mpv reports its default (100) before ours is pushed.
+            if name == "volume" and value is not None and not self._fading and self._volume_synced:
+                self._volume = max(0, min(100, int(value)))
+                self.store.set_setting("volume", self._volume)
             self._schedule_broadcast()
 
     def _on_event(self, message):
         event = message.get("event")
         if event == "file-loaded":
+            path = self.mpv.props.get("path")
+            if self.loading_id is not None and self._loading_source and path and path != self._loading_source:
+                # A stale file-loaded for the file we just replaced.
+                return
             loaded_id = self.loading_id if self.loading_id is not None else self.current_id
             self.loading_id = None
+            self._loading_source = None
             if loaded_id is not None and loaded_id == self.current_id:
                 self.loaded = True
                 self._retries = 0
@@ -184,8 +220,11 @@ class Playback:
                 if self.loaded:
                     self._finished()
             elif reason == "stop" and not self._expect_stop:
+                self.flush_position(force=True, action=True)
                 self.loaded = False
                 self.broadcast_player(force=True)
+            if not self._expect_stop and self.loading_id is None:
+                self.mpv.command_nowait("set_property", "user-data/podcast", None)
             self._expect_stop = False
         elif event in ("seek", "playback-restart"):
             self._schedule_broadcast()
@@ -194,7 +233,10 @@ class Playback:
 
     def player_state(self):
         props = self.mpv.props
-        paused = True if not self.loaded else bool(props.get("pause", True))
+        # While a load is in flight the pause flag already describes the file
+        # on its way in, so the UI can show "playing" before audio starts.
+        active = self.loaded or (self.loading_id is not None and self.mpv.state == "connected")
+        paused = True if not active else bool(props.get("pause", True))
         skip = bool(props.get("user-data/skipsilence/enabled")) if self.loaded else self._skip_silence
         af = props.get("af") or []
         voice = any(isinstance(f, dict) and f.get("label") == "voice" for f in af) if self.loaded else self._voice_boost
@@ -207,8 +249,8 @@ class Playback:
             "idle": not self.loaded,
             "buffering": bool(props.get("paused-for-cache")) if self.loaded else False,
             "speed": round(speed, 3),
-            "baseSpeed": round(self._base_speed, 3),
-            "volume": int(props.get("volume") if props.get("volume") is not None else self.engine.state["player"].get("volume", 100)),
+            "baseSpeed": round(self.effective_speed() if self.current_row is not None else self._base_speed, 3),
+            "volume": int(props.get("volume")) if props.get("volume") is not None and not self._fading else self._volume,
             "mute": bool(props.get("mute")),
             "chapter": int(props.get("chapter")) if self.loaded and props.get("chapter") is not None else -1,
             "skipSilence": skip,
@@ -335,21 +377,31 @@ class Playback:
                 return _clamp_speed(podcast["speed"])
         return _clamp_speed(self._base_speed)
 
-    async def play(self, episode_id):
+    async def play(self, episode_id, pos=None):
         row = self.engine.library.require_episode(episode_id)
-        if self.current_id == row["id"] and self.loaded and self.loading_id is None:
+        if self.current_id == row["id"] and self.loaded and self.loading_id is None and pos is None:
             await self._set_pause(False)
             return self.player_state()
-        if self.current_id is not None and self.loaded and self.current_id != row["id"]:
-            self.flush_position(force=True, action=True)
+        if self.mpv.state != "connected":
+            raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv is not running yet; try again in a moment")
+        # mpv emits end-file(stop) for a file it replaces, whether or not we
+        # still count it as loaded (retries clear `loaded` first).
+        was_loaded = self.loaded or self.mpv.props.get("idle-active") is False
+        if self.current_id is not None and self.loaded:
+            self.flush_position(force=True, action=self.current_id != row["id"])
         source, local = self._source_for(row)
-        start = self._resume_position(row)
+        start = max(0.0, float(pos)) if pos is not None else self._resume_position(row)
         if row["played"]:
             self.store.execute("UPDATE episodes SET played = 0, played_at = NULL, position = 0 WHERE id = ?", (row["id"],))
+        if self.current_id != row["id"]:
+            self._eof_retried_for = None
+            if self.sleep["mode"] == "chapter":
+                self.sleep["chapter"] = None
         self.current_id = row["id"]
         self.current_row = row
         self.loaded = False
         self.loading_id = row["id"]
+        self._loading_source = source
         self.pos = start
         self.duration = float(row["duration"] or 0)
         self._finished_for = None
@@ -358,18 +410,18 @@ class Playback:
         self.engine.queue.remove([row["id"]])
         self.broadcast_now_playing()
         self.broadcast_player(force=True)
-        if self.mpv.state != "connected":
-            raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv is not running yet; try again in a moment")
         options = {"start": "%.3f" % start, "force-media-title": _media_title(row)}
         artwork = row["artwork_path"] or row["podcast_artwork_path"]
         if artwork and os.path.exists(artwork):
             options["cover-art-files"] = artwork
-        self._expect_stop = True
+        self._expect_stop = was_loaded
         try:
             await self.mpv.command("loadfile", source, "replace", -1, options)
             await self.mpv.set_property("pause", False)
         except MpvError as error:
             self.loading_id = None
+            self._loading_source = None
+            self._expect_stop = False
             raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv refused to play: %s" % error)
         LOG.info("playing episode %d (%s) from %.0fs %s", row["id"], row["title"][:60], start, "local" if local else "stream")
         artwork = getattr(self.engine, "artwork", None)
@@ -381,33 +433,57 @@ class Playback:
 
     async def _set_pause(self, paused):
         if not self.loaded:
-            if not paused and self.current_id is not None:
+            if self.loading_id is not None and self.mpv.state == "connected":
+                # Still loading: mpv applies pause to the file on its way in.
+                await self._pause_property(bool(paused))
+            elif not paused and self.current_id is not None:
                 await self.play(self.current_id)
             return
-        await self.mpv.set_property("pause", bool(paused))
+        await self._pause_property(bool(paused))
+
+    async def _pause_property(self, paused):
+        await self.mpv.set_property("pause", paused)
+        # The reply to this command beats mpv's property-change event; the
+        # state handed back should already say what was asked for.
+        self.mpv.props["pause"] = paused
 
     async def toggle(self):
         if not self.loaded:
-            if self.current_id is not None:
+            if self.loading_id is not None and self.mpv.state == "connected":
+                await self._pause_property(not bool(self.mpv.props.get("pause")))
+            elif self.current_id is not None:
                 await self.play(self.current_id)
             elif self.engine.queue.head() is not None:
                 await self.play(self.engine.queue.head())
             else:
                 raise protocol.ProtocolError(protocol.NOT_FOUND, "nothing to play")
             return self.player_state()
-        await self.mpv.set_property("pause", not bool(self.mpv.props.get("pause")))
+        await self._pause_property(not bool(self.mpv.props.get("pause")))
         return self.player_state()
 
-    async def stop_playback(self):
-        self.flush_position(force=True, action=True)
-        if self.loaded:
+    async def stop_playback(self, clear=False):
+        """Stop mpv; with clear=True also forget the current episode (it was
+        removed from the library)."""
+        if not clear:
+            self.flush_position(force=True, action=True)
+        if (self.loaded or self.loading_id is not None) and self.mpv.state == "connected":
             self._expect_stop = True
             try:
                 await self.mpv.command("stop")
+                self.mpv.command_nowait("set_property", "user-data/podcast", None)
             except MpvError:
-                pass
+                self._expect_stop = False
         self.loaded = False
         self.loading_id = None
+        self._loading_source = None
+        if clear:
+            self.current_id = None
+            self.current_row = None
+            self.pos = 0.0
+            self.duration = 0.0
+            self._finished_for = None
+            self.store.set_setting("lastEpisodeId", None)
+            self.broadcast_now_playing()
         self.broadcast_player(force=True)
         return self.player_state()
 
@@ -454,13 +530,26 @@ class Playback:
     def _finished(self):
         if self.current_id is None or self._finished_for == self.current_id:
             return
-        self._finished_for = self.current_id
         finished_id = self.current_id
+        duration = self.duration or float((self.current_row or {"duration": 0})["duration"] or 0)
+        streaming = str(self.mpv.props.get("path") or "").lower().startswith(("http://", "https://"))
+        if (streaming and duration > 0 and self.pos / duration < PLAYED_THRESHOLD and self.pos < duration - 30
+                and self._eof_retried_for != finished_id):
+            # Ended well before the declared duration: possibly a dropped
+            # connection. Reload once from here; if the stream ends there
+            # again the duration was wrong and this really is the end.
+            self._eof_retried_for = finished_id
+            LOG.warning("episode %d ended early at %.0f/%.0fs; reconnecting", finished_id, self.pos, duration)
+            self.engine.notice("warn", "The stream ended early; reconnecting…")
+            self.loaded = False
+            self.engine.loop.create_task(self._retry(self.current_row, self.pos))
+            return
+        self._finished_for = finished_id
         LOG.info("episode %d finished", finished_id)
         self.pos = self.duration or self.pos
         self.flush_position(force=True, action=True)
         self.engine.library.mark_played([finished_id], True)
-        if self.sleep["mode"] == "episode":
+        if self.sleep["mode"] in ("episode", "chapter"):
             self._sleep_fire()
             return
         if not self.engine.settings.continuousPlayback:
@@ -492,14 +581,14 @@ class Playback:
         self.engine.notice("error", "Could not play “%s”: %s" % (row["title"][:60] if row else "episode", detail), episode_id=self.current_id)
         self.broadcast_player(force=True)
 
-    async def _retry(self, row):
+    async def _retry(self, row, pos=None):
         if row is None or self.current_id != row["id"]:
             return
         # A broken download falls back to the stream.
-        if models.download_state(row) == "done":
+        if pos is None and models.download_state(row) == "done":
             self.store.execute("UPDATE downloads SET status = 'error', error = 'file would not play' WHERE episode_id = ?", (row["id"],))
         try:
-            await self.play(row["id"])
+            await self.play(row["id"], pos=pos)
         except protocol.ProtocolError as error:
             self.engine.notice("error", error.message, episode_id=row["id"])
 
@@ -516,7 +605,9 @@ class Playback:
             return
         LOG.warning("stream stalled for %ds; reloading", STALL_SECONDS)
         self.engine.notice("warn", "The stream stalled; reconnecting…")
-        self.engine.loop.create_task(self._retry(self.current_row))
+        self.flush_position(force=True)
+        self.loaded = False
+        self.engine.loop.create_task(self._retry(self.current_row, self.pos))
 
     # ---- speed and audio toggles -------------------------------------------
 
@@ -529,6 +620,7 @@ class Playback:
         else:
             try:
                 await self.mpv.set_property("speed", speed)
+                self.mpv.props["speed"] = speed
             except MpvError:
                 pass
 
@@ -545,6 +637,7 @@ class Playback:
 
     async def set_volume(self, volume):
         volume = max(0, min(100, int(volume)))
+        self._volume = volume
         self.store.set_setting("volume", volume)
         if self.mpv.state == "connected":
             await self.mpv.set_property("volume", volume)
@@ -634,18 +727,21 @@ class Playback:
         if not self.loaded or self.mpv.state != "connected":
             self.broadcast_player(force=True)
             return
-        volume = int(self.mpv.props.get("volume") or 100)
+        volume = self._volume
         self._fading = True
         try:
             for step in range(1, FADE_STEPS + 1):
                 await self.mpv.set_property("volume", int(volume * (1 - step / FADE_STEPS)))
                 await asyncio.sleep(FADE_SECONDS / FADE_STEPS)
             await self.mpv.set_property("pause", True)
-            await self.mpv.set_property("volume", volume)
         except MpvError:
             pass
         finally:
             self._fading = False
+            try:
+                await self.mpv.set_property("volume", self._volume)
+            except MpvError:
+                pass
         LOG.info("sleep timer paused playback")
         self.engine.notice("info", "Sleep timer: paused")
         self.broadcast_player(force=True)
@@ -683,70 +779,96 @@ def _pb(engine):
     return engine.playback
 
 
-@protocol.command("play", "Play an episode (resumes where it stopped)", episodeId=A(int))
-async def cmd_play(engine, client, episodeId):
-    return {"player": await _pb(engine).play(episodeId)}
+def _guarded(fn):
+    """Command wrapper: a lost mpv mid-command is 'unavailable', not a crash."""
+    async def wrapper(engine, client, **kwargs):
+        try:
+            return await fn(engine, client, **kwargs)
+        except MpvError as error:
+            raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv did not respond: %s" % error)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+@protocol.command("play", "Play an episode (resumes where it stopped, or at pos)", episodeId=A(int),
+                  pos=A(float, required=False, minimum=0))
+@_guarded
+async def cmd_play(engine, client, episodeId, pos):
+    return {"player": await _pb(engine).play(episodeId, pos=pos)}
 
 
 @protocol.command("pause", "Pause")
+@_guarded
 async def cmd_pause(engine, client):
     await _pb(engine)._set_pause(True)
     return {"player": _pb(engine).player_state()}
 
 
 @protocol.command("resume", "Resume")
+@_guarded
 async def cmd_resume(engine, client):
     await _pb(engine)._set_pause(False)
     return {"player": _pb(engine).player_state()}
 
 
 @protocol.command("toggle", "Play or pause")
+@_guarded
 async def cmd_toggle(engine, client):
     return {"player": await _pb(engine).toggle()}
 
 
 @protocol.command("stop", "Stop and unload")
+@_guarded
 async def cmd_stop(engine, client):
     return {"player": await _pb(engine).stop_playback()}
 
 
 @protocol.command("seek", "Seek", pos=A(float), mode=A(str, required=False, default="absolute", choices=["absolute", "relative"]))
+@_guarded
 async def cmd_seek(engine, client, pos, mode):
     return {"player": await _pb(engine).seek(pos, mode)}
 
 
 @protocol.command("skip", "Skip back or forward by the configured amount", direction=A(str, choices=["back", "forward"]))
+@_guarded
 async def cmd_skip(engine, client, direction):
     return {"player": await _pb(engine).skip(direction)}
 
 
 @protocol.command("set-speed", "Playback speed, globally or for one podcast",
                   speed=A(float, minimum=SPEED_MIN, maximum=SPEED_MAX), podcastId=A(int, required=False))
+@_guarded
 async def cmd_set_speed(engine, client, speed, podcastId):
     return {"player": await _pb(engine).set_speed(speed, podcastId)}
 
 
 @protocol.command("set-volume", "Volume 0-100", volume=A(int, minimum=0, maximum=100))
+@_guarded
 async def cmd_set_volume(engine, client, volume):
     return {"player": await _pb(engine).set_volume(volume)}
 
 
 @protocol.command("set-mute", "Mute", mute=A(bool))
+@_guarded
 async def cmd_set_mute(engine, client, mute):
     return {"player": await _pb(engine).set_mute(mute)}
 
 
 @protocol.command("next", "Play the first episode in Up Next")
+@_guarded
 async def cmd_next(engine, client):
     return {"player": await _pb(engine).next_episode()}
 
 
 @protocol.command("previous", "Restart the episode")
+@_guarded
 async def cmd_previous(engine, client):
     return {"player": await _pb(engine).previous()}
 
 
 @protocol.command("set-chapter", "Jump to a chapter", index=A(int, minimum=0))
+@_guarded
 async def cmd_set_chapter(engine, client, index):
     return {"player": await _pb(engine).set_chapter(index)}
 
@@ -758,11 +880,13 @@ def cmd_sleep_timer(engine, client, mode, minutes):
 
 
 @protocol.command("set-skip-silence", "Speed through silence", enabled=A(bool))
+@_guarded
 async def cmd_set_skip_silence(engine, client, enabled):
     return {"player": await _pb(engine).set_skip_silence(enabled)}
 
 
 @protocol.command("set-voice-boost", "Even out voices", enabled=A(bool))
+@_guarded
 async def cmd_set_voice_boost(engine, client, enabled):
     return {"player": await _pb(engine).set_voice_boost(enabled)}
 

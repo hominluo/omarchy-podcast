@@ -13,6 +13,7 @@ import asyncio
 import base64
 import datetime
 import json
+import sqlite3
 import time
 import urllib.parse
 
@@ -138,6 +139,7 @@ class Sync:
         self.engine = engine
         self.store = None
         self._running = False
+        self._task = None
         self._debounce = None
         self._last_error = ""
         self._last_sync = 0
@@ -154,6 +156,12 @@ class Sync:
     async def stop(self, restart=False, quit_mpv=True):
         if self._debounce is not None:
             self._debounce.cancel()
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
     @property
     def enabled(self):
@@ -166,21 +174,36 @@ class Sync:
                       self.engine.credential("sync", "password"), settings.sync_device_id)
 
     def _broadcast(self):
+        if self.store is None or getattr(self.store, "conn", None) is None:
+            return  # the store is already closed: shutting down
+        try:
+            pending = (self.store.scalar("SELECT COUNT(*) FROM episode_actions WHERE synced = 0", default=0)
+                       + self.store.scalar("SELECT COUNT(*) FROM subscription_changes WHERE synced = 0", default=0))
+        except sqlite3.Error:
+            return
         self.engine.set_state("sync", {
             "provider": str(self.engine.settings.syncProvider or "none"),
             "configured": self.enabled,
             "lastSyncAt": self._last_sync,
             "lastError": self._last_error,
-            "pending": self.store.scalar("SELECT COUNT(*) FROM episode_actions WHERE synced = 0", default=0)
-            + self.store.scalar("SELECT COUNT(*) FROM subscription_changes WHERE synced = 0", default=0),
+            "pending": pending,
             "syncing": self._running,
         })
 
     def _on_settings(self):
         scheduler = self.engine.scheduler
-        scheduler.jobs = [job for job in scheduler.jobs if job.name != "sync"]
-        if self.enabled:
-            scheduler.every("sync", max(60, int(self.engine.settings.syncIntervalMin) * 60), self.run, initial_delay=5)
+        interval = max(60, int(self.engine.settings.syncIntervalMin) * 60)
+        existing = [job for job in scheduler.jobs if job.name == "sync"]
+        if self.enabled and existing:
+            # Keep the job object: a run in flight stays owned by the scheduler
+            # so stop() can wait for it; only the cadence changes.
+            for job in existing:
+                job.interval = interval
+                job.next_at = min(job.next_at, time.monotonic() + 5)
+        elif self.enabled:
+            scheduler.every("sync", interval, self.run, initial_delay=5)
+        else:
+            scheduler.jobs = [job for job in scheduler.jobs if job.name != "sync"]
         self._broadcast()
 
     def request_soon(self):
@@ -189,7 +212,11 @@ class Sync:
             return
         if self._debounce is not None:
             self._debounce.cancel()
-        self._debounce = self.engine.loop.call_later(DEBOUNCE_SECONDS, lambda: asyncio.ensure_future(self.run()))
+        self._debounce = self.engine.loop.call_later(DEBOUNCE_SECONDS, self._start_run)
+
+    def _start_run(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.ensure_future(self.run())
 
     # ---- the cycle ---------------------------------------------------------
 
@@ -210,6 +237,8 @@ class Sync:
             self.store.set_sync_state("last_sync_at", self._last_sync)
             LOG.info("sync with %s done", client.provider)
             return {"synced": True, "at": self._last_sync}
+        except asyncio.CancelledError:
+            raise
         except SyncError as error:
             self._last_error = str(error)
             LOG.warning("sync failed: %s", error)
@@ -225,16 +254,31 @@ class Sync:
 
     async def _sync_subscriptions(self, client):
         library = self.engine.library
-        pending = self.store.all("SELECT id, feed_url, action FROM subscription_changes WHERE synced = 0 ORDER BY timestamp")
-        add = [r["feed_url"] for r in pending if r["action"] == "add"]
-        remove = [r["feed_url"] for r in pending if r["action"] == "remove"]
+        pending = self.store.all("SELECT id, feed_url, action FROM subscription_changes WHERE synced = 0 ORDER BY timestamp, id")
+        # Only the last word per feed counts: an add followed by a remove
+        # pushed together is an error at gpodder.net.
+        latest = {}
+        for row in pending:
+            latest[row["feed_url"]] = row["action"]
+        add = [url for url, action in latest.items() if action == "add"]
+        remove = [url for url, action in latest.items() if action == "remove"]
         if pending:
             result = await self.engine.run_in_thread(client.push_subscriptions, add, remove)
             self.store.execute("UPDATE subscription_changes SET synced = 1 WHERE id IN (%s)" % ",".join(str(r["id"]) for r in pending))
             for pair in (result or {}).get("update_urls", []) or []:
-                if isinstance(pair, list) and len(pair) == 2 and pair[0] != pair[1] and pair[1]:
-                    self.store.execute("UPDATE podcasts SET feed_url = ? WHERE feed_url = ?", (pair[1], pair[0]))
+                if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str) and isinstance(pair[1], str)):
+                    continue
+                if pair[0] == pair[1] or not pair[1].lower().startswith(("http://", "https://")):
+                    continue
+                try:
+                    self.store.execute("UPDATE podcasts SET feed_url = ? WHERE feed_url = ?", (pair[1][:2000], pair[0]))
+                except sqlite3.IntegrityError:
+                    LOG.warning("sync: server rewrote %s to %s, which is already subscribed", pair[0], pair[1])
         since = int(self.store.get_sync_state("last_sub_ts", 0) or 0)
+        # Changes recorded while the remote ones are applied below belong to
+        # the user (unless they concern the very feeds the server sent).
+        mark_from = int(self.store.scalar("SELECT COALESCE(MAX(id), 0) FROM subscription_changes", default=0) or 0)
+        touched = set()
         remote = await self.engine.run_in_thread(client.pull_subscriptions, since)
         known = {canonical_feed_url(r["feed_url"]): r for r in self.store.all("SELECT id, feed_url, subscribed_at FROM podcasts")}
         local_removed = {canonical_feed_url(r["feed_url"]) for r in self.store.all(
@@ -243,8 +287,11 @@ class Sync:
             key = canonical_feed_url(url)
             if key in known or key in local_removed:
                 continue
+            touched.add(key)
             try:
-                await library.subscribe(url)
+                summary = await library.subscribe(url)
+                # A redirect may have stored the feed under another URL.
+                touched.add(canonical_feed_url(summary.get("feedUrl") or url))
                 LOG.info("sync: subscribed to %s", url)
             except protocol.ProtocolError as error:
                 LOG.warning("sync: could not subscribe to %s: %s", url, error.message)
@@ -255,10 +302,13 @@ class Sync:
             # A subscription made here after the remote removal stays.
             if int(row["subscribed_at"] or 0) > since:
                 continue
+            touched.add(canonical_feed_url(row["feed_url"]))
             library.unsubscribe(row["id"], False)
             LOG.info("sync: unsubscribed from %s", url)
         # Those came from the server; do not push them back.
-        self.store.execute("UPDATE subscription_changes SET synced = 1 WHERE synced = 0")
+        for row in self.store.all("SELECT id, feed_url FROM subscription_changes WHERE synced = 0 AND id > ?", (mark_from,)):
+            if canonical_feed_url(row["feed_url"]) in touched:
+                self.store.execute("UPDATE subscription_changes SET synced = 1 WHERE id = ?", (row["id"],))
         stamp = (remote or {}).get("timestamp")
         self.store.set_sync_state("last_sub_ts", int(stamp) if isinstance(stamp, (int, float)) else now())
 
@@ -300,9 +350,16 @@ class Sync:
     def _find_episode(self, action):
         guid = str(action.get("guid") or "")
         url = str(action.get("episode") or "")
+        feed = canonical_feed_url(str(action.get("podcast") or ""))
         row = None
         if guid:
-            row = self.store.one("SELECT id, position, position_updated_at, duration, played FROM episodes WHERE guid = ?", (guid,))
+            # GUIDs are only unique within a feed.
+            candidates = self.store.all("SELECT e.id, e.position, e.position_updated_at, e.duration, e.played, p.feed_url "
+                                        "FROM episodes e JOIN podcasts p ON p.id = e.podcast_id WHERE e.guid = ?", (guid,))
+            for candidate in candidates:
+                if not feed or canonical_feed_url(candidate["feed_url"]) == feed:
+                    row = candidate
+                    break
         if row is None and url:
             row = self.store.one("SELECT id, position, position_updated_at, duration, played FROM episodes WHERE enclosure_url = ?", (url,))
             if row is None:

@@ -85,6 +85,11 @@ test("sanitizeShowNotes strips the dangerous parts", () => {
   assert.ok(/<p>Hi/.test(clean))
 })
 
+test("escapeHtml neutralises markup", () => {
+  assert.equal(M.escapeHtml('<b>"x" & y</b>'), "&lt;b&gt;&quot;x&quot; &amp; y&lt;/b&gt;")
+  assert.equal(M.escapeHtml(null), "")
+})
+
 test("formatBytes", () => {
   assert.equal(M.formatBytes(512), "512 B")
   assert.equal(M.formatBytes(1536), "1.5 KB")

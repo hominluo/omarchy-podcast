@@ -82,6 +82,12 @@ function chapterIndexAt(chapters, t) {
   return indexAtTime(chapters, t)
 }
 
+// Plain text on its way into a RichText Text: the four characters that would
+// otherwise be read as markup.
+function escapeHtml(text) {
+  return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+}
+
 // Transcript segments also carry endTime; between segments (a pause) the
 // previous one stays current so the highlight does not flicker off.
 function segmentIndexAt(segments, t) {
@@ -200,6 +206,6 @@ if (typeof module !== "undefined") {
     formatRelativeDate: formatRelativeDate, elide: elide, indexAtTime: indexAtTime, chapterIndexAt: chapterIndexAt,
     segmentIndexAt: segmentIndexAt, nextSpeed: nextSpeed, formatSpeed: formatSpeed, sleepLabel: sleepLabel,
     filterEpisodes: filterEpisodes, searchMatches: searchMatches, patchById: patchById, removeById: removeById,
-    sanitizeShowNotes: sanitizeShowNotes, stripTags: stripTags, progressFraction: progressFraction, formatBytes: formatBytes,
+    sanitizeShowNotes: sanitizeShowNotes, stripTags: stripTags, escapeHtml: escapeHtml, progressFraction: progressFraction, formatBytes: formatBytes,
   }
 }

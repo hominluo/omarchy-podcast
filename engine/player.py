@@ -34,6 +34,7 @@ OBSERVED = (
 CONNECT_BUDGET = 6.0
 SPAWN_LIMIT = 5          # per minute
 COMMAND_TIMEOUT = 6.0
+READ_LIMIT = 16 * 1024 * 1024
 
 
 class MpvError(Exception):
@@ -233,7 +234,9 @@ class MpvClient:
         delay = 0.02
         while time.monotonic() < deadline and not self._stopping:
             try:
-                self.reader, self.writer = await asyncio.open_unix_connection(self.paths.mpv_socket_path)
+                # A chapter-list or metadata dump from a long file can run past
+                # asyncio's 64 KiB default line limit.
+                self.reader, self.writer = await asyncio.open_unix_connection(self.paths.mpv_socket_path, limit=READ_LIMIT)
                 self.connected = True
                 return True
             except (OSError, ConnectionError):
@@ -255,7 +258,11 @@ class MpvClient:
         if self.on_connect:
             asyncio.ensure_future(self._run_on_connect())
         while not self._stopping:
-            line = await self.reader.readline()
+            try:
+                line = await self.reader.readline()
+            except (asyncio.LimitOverrunError, ValueError):
+                LOG.warning("mpv sent a line over %d bytes; dropping it", READ_LIMIT)
+                continue
             if not line:
                 LOG.warning("mpv closed the connection")
                 return

@@ -23,6 +23,8 @@ import time
 from . import PROTOCOL, VERSION, log
 from .config import Paths
 
+LOCK_FD_ENV = "OMARCHY_PODCAST_LOCK_FD"
+
 
 def main(argv, launcher=None):
     parser = argparse.ArgumentParser(prog="podcastd", description="Omarchy-Podcast engine")
@@ -99,13 +101,28 @@ def run_serve(paths, launcher, foreground=False, debug=False, replace=False):
         return 1
 
     if restart and launcher:
-        release_lock(lock)
+        # The lock travels through exec so no second instance can slip in
+        # between the old process and the new one.
+        os.set_inheritable(lock, True)
+        os.environ[LOCK_FD_ENV] = str(lock)
         engine.exec_restart()
     release_lock(lock)
     return 0
 
 
 def acquire_lock(paths, replace=False):
+    inherited = os.environ.pop(LOCK_FD_ENV, None)
+    if inherited:
+        try:
+            fd = int(inherited)
+            if os.fstat(fd).st_ino == os.stat(paths.lock_path).st_ino:
+                os.set_inheritable(fd, False)
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, str(os.getpid()).encode("ascii"), 0)
+                return fd
+            os.close(fd)
+        except (ValueError, OSError):
+            pass
     fd = os.open(paths.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     for attempt in range(60):
         try:

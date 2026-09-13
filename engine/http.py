@@ -6,12 +6,13 @@ and conditional requests (ETag / Last-Modified) turn an unchanged feed into a
 cheap 304. Blocking by design: callers run it in a worker thread.
 """
 
-import gzip
+import http.client
 import io
 import os
 import socket
 import ssl
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,12 @@ FEED_CAP = 50 * 1024 * 1024
 SMALL_CAP = 5 * 1024 * 1024
 ARTWORK_CAP = 10 * 1024 * 1024
 CHUNK = 64 * 1024
+# A whole in-memory fetch has this long (plus one socket timeout), whatever
+# the per-read timeout says, so a server trickling one byte at a time cannot
+# pin a pool thread. Reads use read1(): at most one recv per call, so the
+# deadline is checked at least every socket timeout.
+TOTAL_DEADLINE = 300
+SENSITIVE_HEADERS = ("authorization", "x-auth-key", "x-auth-date", "cookie")
 
 
 class FetchError(Exception):
@@ -72,20 +79,49 @@ class Response:
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
-    """Follow a few redirects, and only to http(s)."""
+    """Follow a few redirects, only to http(s), and never carry credentials
+    to another host or down to plain http."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        scheme = urllib.parse.urlsplit(newurl).scheme.lower()
+        target = urllib.parse.urlsplit(newurl)
+        scheme = target.scheme.lower()
         if scheme not in ("http", "https"):
             raise FetchError("bad-url", "redirect to unsupported scheme %r" % scheme, status=code)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        origin = urllib.parse.urlsplit(req.full_url)
+        crosses = target.netloc.lower() != origin.netloc.lower() or (origin.scheme == "https" and scheme == "http")
+        if crosses:
+            for name in list(new.headers.keys()):
+                if name.lower() in SENSITIVE_HEADERS:
+                    del new.headers[name]
+            for name in list(new.unredirected_hdrs.keys()):
+                if name.lower() in SENSITIVE_HEADERS:
+                    del new.unredirected_hdrs[name]
+        return new
 
 
 def check_url(url):
-    parts = urllib.parse.urlsplit(str(url or "").strip())
+    """Validate and normalise a URL for urllib: http(s) only, no control
+    characters, and the path/query percent-encoded (feeds ship enclosure
+    URLs with literal spaces, which http.client rejects outright)."""
+    text = str(url or "").strip()
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise FetchError("bad-url", "the link contains control characters")
+    parts = urllib.parse.urlsplit(text)
     if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
         raise FetchError("bad-url", "only http and https links can be fetched")
-    return urllib.parse.urlunsplit(parts)
+    try:
+        parts.port  # raises for a malformed port
+    except ValueError:
+        raise FetchError("bad-url", "the link has an invalid port")
+    path = urllib.parse.quote(parts.path, safe="/%:@&=+$,;~!*'()")
+    query = urllib.parse.quote(parts.query, safe="/%:@&=+$,;~!*'()?")
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, query, ""))
+
+
+NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, socket.timeout, TimeoutError, ConnectionError, OSError)
 
 
 def _opener():
@@ -115,49 +151,77 @@ def fetch(url, cap=SMALL_CAP, timeout=DEFAULT_TIMEOUT, etag=None, last_modified=
         with _opener().open(request, timeout=timeout) as response:
             body = _read_capped(response, cap)
             return Response(response.geturl(), response.status, response.headers, body)
+    except FetchError:
+        raise
     except urllib.error.HTTPError as error:
         if error.code == 304:
             raise NotModified()
         raise FetchError("http", "server answered %d %s" % (error.code, error.reason or ""), status=error.code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as error:
+    except NETWORK_ERRORS as error:
         reason = getattr(error, "reason", error)
+        if isinstance(reason, ssl.SSLError):
+            raise FetchError("tls", "secure connection failed: %s" % _short(reason))
         raise FetchError("network", "could not reach the server: %s" % _short(reason))
-    except FetchError:
-        raise
 
 
 def _read_capped(response, cap):
+    """Read at most `cap` bytes *after* decompression. The body is inflated
+    incrementally so a compressed bomb is rejected at the cap instead of
+    being expanded in full first."""
     encoding = (response.headers.get("Content-Encoding") or "").lower()
-    raw = io.BytesIO()
+    started = time.monotonic()
+    out = io.BytesIO()
     total = 0
+    inflater = None
+    sniffed = False
+    head = b""
     while True:
-        chunk = response.read(CHUNK)
+        chunk = response.read1(CHUNK)
         if not chunk:
             break
-        total += len(chunk)
-        if total > cap:
-            raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
-        raw.write(chunk)
-    body = raw.getvalue()
-    # Servers lie about gzip in both directions: sniff the magic bytes.
-    if body[:2] == b"\x1f\x8b":
-        try:
-            body = gzip.decompress(body)
-        except (OSError, EOFError, zlib.error) as error:
-            raise FetchError("http", "could not decompress the response: %s" % _short(error))
-    elif encoding == "deflate":
-        try:
-            body = zlib.decompress(body)
-        except zlib.error:
+        if time.monotonic() - started > TOTAL_DEADLINE:
+            raise FetchError("network", "the server is too slow")
+        if not sniffed:
+            # read1 may hand back a single byte first; the magic needs two.
+            head += chunk
+            if len(head) < 2:
+                continue
+            chunk, head = head, b""
+            sniffed = True
+            # Servers lie about gzip in both directions: sniff the magic bytes.
+            if chunk[:2] == b"\x1f\x8b":
+                inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            elif encoding == "deflate":
+                inflater = zlib.decompressobj(zlib.MAX_WBITS if chunk[:1] == b"\x78" else -zlib.MAX_WBITS)
+        if inflater is None:
+            piece = chunk
+        else:
             try:
-                body = zlib.decompress(body, -zlib.MAX_WBITS)
+                piece = inflater.decompress(chunk, cap - total + 1)
             except zlib.error as error:
                 raise FetchError("http", "could not decompress the response: %s" % _short(error))
-    if len(body) > cap:
-        raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
-    return body
+            if inflater.unconsumed_tail:
+                raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
+        total += len(piece)
+        if total > cap:
+            raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
+        out.write(piece)
+    if head:
+        # A one-byte body never reached the sniff.
+        out.write(head)
+        total += len(head)
+    if inflater is not None:
+        try:
+            tail = inflater.flush()
+        except zlib.error as error:
+            raise FetchError("http", "could not decompress the response: %s" % _short(error))
+        total += len(tail)
+        if total > cap:
+            raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
+        out.write(tail)
+    return out.getvalue()
 
 
 def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET"):
@@ -170,15 +234,25 @@ def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET"):
     request = urllib.request.Request(url, headers=merged, method=method)
     try:
         return _opener().open(request, timeout=timeout)
+    except FetchError:
+        raise
     except urllib.error.HTTPError as error:
         if error.code == 416:
             raise FetchError("http", "range not satisfiable", status=416)
         raise FetchError("http", "server answered %d %s" % (error.code, error.reason or ""), status=error.code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as error:
+    except NETWORK_ERRORS as error:
         reason = getattr(error, "reason", error)
         raise FetchError("network", "could not reach the server: %s" % _short(reason))
+
+
+def read_chunk(response):
+    """One read from a streaming response with the network errors mapped."""
+    try:
+        return response.read1(CHUNK)
+    except NETWORK_ERRORS as error:
+        raise FetchError("network", "the connection dropped: %s" % _short(error))
 
 
 def download_to_file(url, path, cap, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -189,10 +263,13 @@ def download_to_file(url, path, cap, timeout=DEFAULT_TIMEOUT, headers=None):
     fd, tmp = tempfile.mkstemp(prefix=".dl.", dir=_dirname(path))
     try:
         with open(fd, "wb") as handle:
+            started = time.monotonic()
             while True:
-                chunk = response.read(CHUNK)
+                chunk = read_chunk(response)
                 if not chunk:
                     break
+                if time.monotonic() - started > TOTAL_DEADLINE:
+                    raise FetchError("network", "the server is too slow")
                 total += len(chunk)
                 if total > cap:
                     raise FetchError("too-large", "the file is larger than %d MB" % (cap // (1024 * 1024)))

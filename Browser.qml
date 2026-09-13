@@ -90,10 +90,23 @@ Item {
     root.helpOpen = false
     root.editing = false
     root.opened = true
-    if (target !== "" && (target !== view || payload.episodeId || payload.podcastId)) root.navigate(target, payload, root.history.length > 0)
-    else if (target === "") { root.history = []; root.viewArgs = payload; if (!hasEpisode && view === "nowPlaying") root.view = "library" }
+    if (target !== "" && (target !== view || payload.episodeId || payload.podcastId)) {
+      root.navigate(target, payload, root.history.length > 0)
+    } else if (target === "") {
+      // A plain reopen keeps the view where it was; only views that cannot
+      // stand without their arguments fall back to the library.
+      root.history = []
+      if (view === "nowPlaying" && !hasEpisode) root.view = "library"
+      else if (view === "podcast" && !(root.viewArgs && root.viewArgs.podcastId)) root.view = "library"
+      // Episode-scoped arguments do not outlive the window: Now Playing
+      // follows the player again on reopen.
+      if (root.view !== "podcast") root.viewArgs = {}
+    }
     root.refocus()
   }
+
+  // A view that stops editing hands the keyboard back to the catcher.
+  onEditingChanged: if (!editing && opened) refocus()
 
   function close() {
     root.opened = false
@@ -207,8 +220,8 @@ Item {
 
     // Global playback chords (available from any view).
     if (root.service) {
-      if (event.text === "[") { root.service.setSpeed(Model.nextSpeed(root.player.baseSpeed || 1, -1)); event.accepted = true; return }
-      if (event.text === "]") { root.service.setSpeed(Model.nextSpeed(root.player.baseSpeed || 1, 1)); event.accepted = true; return }
+      if (event.text === "[") { root.service.setCurrentSpeed(Model.nextSpeed(root.player.baseSpeed || 1, -1)); event.accepted = true; return }
+      if (event.text === "]") { root.service.setCurrentSpeed(Model.nextSpeed(root.player.baseSpeed || 1, 1)); event.accepted = true; return }
       if (event.text === ",") { root.service.seekRelative(-(Number(root.service.setting("skipBack", 15)) || 15)); event.accepted = true; return }
       if (event.text === ".") { root.service.seekRelative(Number(root.service.setting("skipForward", 30)) || 30); event.accepted = true; return }
     }

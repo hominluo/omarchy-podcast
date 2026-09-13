@@ -8,11 +8,13 @@ plain text with or without `[hh:mm:ss]` prefixes all come out the other end.
 
 import html
 import json
+import math
 import re
 from html.parser import HTMLParser
 
 from .canonical import segment
 
+MAX_TIME = 100 * 3600  # seconds; anything beyond is a broken timestamp
 MAX_BYTES = 5 * 1024 * 1024
 PREFERENCE = ("application/json", "text/vtt", "application/x-subrip", "application/srt", "text/srt", "text/html", "text/plain")
 
@@ -109,10 +111,15 @@ def parse_srt(data):
 
 
 def _number(value):
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if math.isnan(number) or math.isinf(number) or number < 0:
+        return None
+    return number
 
 
 def parse_json(data):
@@ -136,6 +143,8 @@ def parse_json(data):
         if start > 100000 and (end is None or end > 100000):
             start /= 1000.0
             end = end / 1000.0 if end is not None else None
+        if start > MAX_TIME or (end is not None and end > MAX_TIME):
+            continue
         segments.append(segment(start, end, body, item.get("speaker", "")))
     return _sorted(segments), bool(segments)
 

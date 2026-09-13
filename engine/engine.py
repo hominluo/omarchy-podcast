@@ -22,6 +22,7 @@ from .server import Server
 from .store import Store
 
 LOG = log.get("engine")
+RESTARTED_FOR_ENV = "OMARCHY_PODCAST_RESTARTED_FOR"
 
 # Slices every client can expect in a snapshot, with their empty values.
 EMPTY_STATE = {
@@ -59,9 +60,13 @@ class Engine:
         self.subsystems = []
         self._stop = None
         self._restart = False
+        self._restart_for = None
         self._quit_mpv = True
         self._last_restart_check = 0.0
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="podcast-io")
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=12, thread_name_prefix="podcast-io")
+        # ffmpeg and whisper runs take minutes; they get their own lane so
+        # they never starve feed fetches and downloads of a thread.
+        self._heavy = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="podcast-heavy")
         self._settings_listeners = []
 
     # ---- lifecycle ---------------------------------------------------------
@@ -103,6 +108,7 @@ class Engine:
                 LOG.exception("subsystem %s failed to stop", type(subsystem).__name__)
         await self.server.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._heavy.shutdown(wait=False, cancel_futures=True)
         self.store.close()
         try:
             os.unlink(self.paths.info_path)
@@ -133,6 +139,9 @@ class Engine:
             argv.append("--foreground")
         if self.debug:
             argv.append("--debug")
+        # The new process must not restart again for the same plugin version
+        # (a manifest bumped without engine/__init__.py would loop forever).
+        os.environ[RESTARTED_FOR_ENV] = self._restart_for or ""
         LOG.info("re-executing: %s", " ".join(argv))
         os.execv(sys.executable, argv)
 
@@ -204,6 +213,10 @@ class Engine:
         """Run blocking `fn(*args)` in the shared pool; returns an asyncio future."""
         return self.loop.run_in_executor(self._executor, fn, *args)
 
+    def run_heavy(self, fn, *args):
+        """Like run_in_thread, on the single lane for long CPU/GPU jobs."""
+        return self.loop.run_in_executor(self._heavy, fn, *args)
+
     # ---- settings ----------------------------------------------------------
 
     def on_settings_changed(self, listener):
@@ -262,7 +275,12 @@ class Engine:
         self._last_restart_check = now
         on_disk = manifest_version(self.paths)
         if on_disk and on_disk == plugin_version:
+            if os.environ.get(RESTARTED_FOR_ENV) == plugin_version:
+                LOG.error("already restarted for plugin %s but the engine still reports %s; "
+                          "engine/__init__.py and manifest.json disagree", plugin_version, VERSION)
+                return
             LOG.info("plugin is %s but engine is %s; restarting into the new code", plugin_version, VERSION)
+            self._restart_for = plugin_version
             self.request_restart()
 
     # ---- diagnostics -------------------------------------------------------

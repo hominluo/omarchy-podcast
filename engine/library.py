@@ -11,8 +11,10 @@ import asyncio
 import json
 import os
 import random
+import sqlite3
 
 from . import feeds, http, log, models, protocol
+from .search import canonical_feed_url
 from .store import now
 
 LOG = log.get("library")
@@ -28,8 +30,9 @@ class Library:
         self.engine = engine
         self.store = None
         self._refreshing = set()
-        self._refresh_task = None
         self._semaphore = None
+        self._jobs_total = 0
+        self._jobs_done = 0
         # Set by the playback subsystem so refreshes can hand new episodes on.
         self.on_new_episodes = None
 
@@ -40,8 +43,7 @@ class Library:
         self.broadcast_inbox()
 
     async def stop(self, restart=False, quit_mpv=True):
-        if self._refresh_task and not self._refresh_task.done():
-            self._refresh_task.cancel()
+        pass
 
     # ---- broadcasts --------------------------------------------------------
 
@@ -122,7 +124,7 @@ class Library:
 
     async def subscribe(self, feed_url):
         url = http.check_url(feed_url)
-        existing = self.store.one("SELECT id FROM podcasts WHERE feed_url = ?", (url,))
+        existing = self._podcast_by_url(url)
         if existing is not None:
             return models.podcast_summary(self.require_podcast(existing["id"]))
         try:
@@ -132,25 +134,35 @@ class Library:
         except feeds.FeedParseError as error:
             raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
 
-        # A redirect may have moved the feed; keep the final URL so the next
-        # refresh does not bounce again, unless that URL is already known.
-        final_url = response.url if response.url and self.store.one("SELECT id FROM podcasts WHERE feed_url = ?", (response.url,)) is None else url
+        # The fetch took a while: a double click or a sync pull may have
+        # subscribed meanwhile, and a redirect may have landed on a feed that
+        # is already in the library under its final URL.
+        final_url = response.url or url
+        existing = self._podcast_by_url(url) or self._podcast_by_url(final_url)
+        if existing is not None:
+            return models.podcast_summary(self.require_podcast(existing["id"]))
         podcast = parsed["podcast"]
         stamp = now()
-        with self.store.transaction():
-            cursor = self.store.execute(
-                """INSERT INTO podcasts (feed_url, title, author, description_html, description_text, link, language,
-                                        image_url, podcast_guid, funding_json, subscribed_at, etag, last_modified,
-                                        last_fetch_at, last_fetch_ok, next_refresh_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
-                (final_url, podcast["title"] or final_url, podcast["author"], podcast["description_html"],
-                 podcast["description_text"], podcast["link"], podcast["language"], podcast["image_url"],
-                 podcast["podcast_guid"], json.dumps(podcast["funding"]), stamp, response.etag, response.last_modified,
-                 stamp, self._next_refresh_at(stamp)))
-            podcast_id = cursor.lastrowid
-            result = self._upsert_episodes(podcast_id, parsed["episodes"], first_fetch=True)
-            self.store.execute(
-                "INSERT INTO subscription_changes (feed_url, action, timestamp) VALUES (?, 'add', ?)", (final_url, stamp))
+        try:
+            with self.store.transaction():
+                cursor = self.store.execute(
+                    """INSERT INTO podcasts (feed_url, title, author, description_html, description_text, link, language,
+                                            image_url, podcast_guid, funding_json, subscribed_at, etag, last_modified,
+                                            last_fetch_at, last_fetch_ok, next_refresh_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                    (final_url, podcast["title"] or final_url, podcast["author"], podcast["description_html"],
+                     podcast["description_text"], podcast["link"], podcast["language"], podcast["image_url"],
+                     podcast["podcast_guid"], json.dumps(podcast["funding"]), stamp, response.etag, response.last_modified,
+                     stamp, self._next_refresh_at(stamp)))
+                podcast_id = cursor.lastrowid
+                result = self._upsert_episodes(podcast_id, parsed["episodes"], first_fetch=True)
+                self.store.execute(
+                    "INSERT INTO subscription_changes (feed_url, action, timestamp) VALUES (?, 'add', ?)", (final_url, stamp))
+        except sqlite3.IntegrityError:
+            existing = self._podcast_by_url(final_url) or self._podcast_by_url(url)
+            if existing is None:
+                raise
+            return models.podcast_summary(self.require_podcast(existing["id"]))
         LOG.info("subscribed to %s (%d episodes)", podcast["title"], len(parsed["episodes"]))
         artwork = getattr(self.engine, "artwork", None)
         if artwork is not None:
@@ -163,28 +175,65 @@ class Library:
         self._settled()
         return models.podcast_summary(self.require_podcast(podcast_id))
 
+    def _podcast_by_url(self, url):
+        row = self.store.one("SELECT id FROM podcasts WHERE feed_url = ?", (url,))
+        if row is not None:
+            return row
+        key = canonical_feed_url(url)
+        for candidate in self.store.all("SELECT id, feed_url FROM podcasts"):
+            if canonical_feed_url(candidate["feed_url"]) == key:
+                return candidate
+        return None
+
     def unsubscribe(self, podcast_id, delete_downloads=False):
         row = self.require_podcast(podcast_id)
-        paths = []
-        if delete_downloads:
-            paths = [r["path"] for r in self.store.all(
-                "SELECT d.path FROM downloads d JOIN episodes e ON e.id = d.episode_id WHERE e.podcast_id = ? AND d.path != ''",
-                (int(podcast_id),))]
+        episode_ids = [r["id"] for r in self.store.all("SELECT id FROM episodes WHERE podcast_id = ?", (int(podcast_id),))]
+        # Files to drop: kept downloads only when asked, cache audio, partial
+        # files and transcript documents always.
+        doomed = []
+        for r in self.store.all(
+                "SELECT d.path, d.temp_path, d.keep FROM downloads d JOIN episodes e ON e.id = d.episode_id WHERE e.podcast_id = ?",
+                (int(podcast_id),)):
+            if r["temp_path"]:
+                doomed.append(r["temp_path"])
+            if r["path"] and (delete_downloads or not r["keep"]):
+                doomed.append(r["path"])
+        for r in self.store.all(
+                "SELECT t.path FROM transcripts t JOIN episodes e ON e.id = t.episode_id WHERE e.podcast_id = ? AND t.path != ''",
+                (int(podcast_id),)):
+            doomed.append(r["path"])
+        downloads = getattr(self.engine, "downloads", None)
+        if downloads is not None and episode_ids:
+            downloads.cancel(episode_ids, quiet=True)
+        transcripts = getattr(self.engine, "transcripts", None)
+        if transcripts is not None:
+            for episode_id in episode_ids:
+                transcripts.forget(episode_id)
+        playback = getattr(self.engine, "playback", None)
+        if playback is not None and playback.current_row is not None and playback.current_row["podcast_id"] == int(podcast_id):
+            asyncio.ensure_future(playback.stop_playback(clear=True))
         with self.store.transaction():
             self.store.execute("DELETE FROM podcasts WHERE id = ?", (int(podcast_id),))
             self.store.execute(
                 "INSERT INTO subscription_changes (feed_url, action, timestamp) VALUES (?, 'remove', ?)",
                 (row["feed_url"], now()))
-        for path in paths:
+        removed = 0
+        for path in doomed:
             try:
                 os.unlink(path)
+                removed += 1
             except OSError:
                 pass
         self.broadcast_library()
         self.broadcast_inbox()
+        queue = getattr(self.engine, "queue", None)
+        if queue is not None:
+            queue.broadcast()
+        if downloads is not None:
+            downloads.broadcast()
         self.engine.emit("unsubscribed", {"podcastId": int(podcast_id)})
         self._settled()
-        return {"podcastId": int(podcast_id), "deletedFiles": len(paths)}
+        return {"podcastId": int(podcast_id), "deletedFiles": removed}
 
     def update_podcast(self, podcast_id, **fields):
         self.require_podcast(podcast_id)
@@ -219,7 +268,9 @@ class Library:
         return stamp + interval + random.randint(0, max(1, interval // 10))
 
     async def refresh(self, podcast_id=None, force=True):
-        """Refresh one podcast, or every one that is due (all, when forced)."""
+        """Refresh one podcast, or every one that is due (all, when forced).
+        Overlapping calls share one progress counter so the jobs slice only
+        reports idle once the last of them is done."""
         if podcast_id is not None:
             self.require_podcast(podcast_id)
             ids = [int(podcast_id)]
@@ -231,30 +282,43 @@ class Library:
         ids = [pid for pid in ids if pid not in self._refreshing]
         if not ids:
             return {"refreshed": 0}
-        self._set_jobs(len(ids), 0)
-        done = 0
+        for pid in ids:
+            self._refreshing.add(pid)
+        self._jobs_total += len(ids)
+        self._set_jobs()
         added_total = 0
 
         async def one(pid):
-            nonlocal done, added_total
-            async with self._semaphore:
-                result = await self.refresh_podcast(pid)
-                added_total += len(result.get("added", []))
-                done += 1
-                self._set_jobs(len(ids), done)
+            nonlocal added_total
+            # The finally also covers a cancel while waiting for the semaphore
+            # (refresh_podcast's own cleanup never runs in that case).
+            try:
+                async with self._semaphore:
+                    result = await self.refresh_podcast(pid)
+                    added_total += len(result.get("added", []))
+            finally:
+                self._refreshing.discard(pid)
+                self._jobs_done += 1
+                self._set_jobs()
 
-        await asyncio.gather(*(one(pid) for pid in ids), return_exceptions=True)
-        self._set_jobs(0, 0)
+        try:
+            await asyncio.gather(*(one(pid) for pid in ids), return_exceptions=True)
+        finally:
+            if self._jobs_done >= self._jobs_total:
+                self._jobs_total = self._jobs_done = 0
+                self._set_jobs()
         self.broadcast_library()
         self.broadcast_inbox()
         return {"refreshed": len(ids), "added": added_total}
 
-    def _set_jobs(self, total, done):
-        self.engine.update_state("jobs", refreshing=total > 0 and done < total, refreshTotal=total, refreshDone=done)
+    def _set_jobs(self):
+        self.engine.update_state("jobs", refreshing=self._jobs_done < self._jobs_total,
+                                 refreshTotal=self._jobs_total, refreshDone=self._jobs_done)
 
     async def refresh_podcast(self, podcast_id):
         row = self.store.one("SELECT * FROM podcasts WHERE id = ?", (int(podcast_id),))
         if row is None:
+            self._refreshing.discard(int(podcast_id))
             return {"added": [], "updated": 0}
         self._refreshing.add(row["id"])
         stamp = now()
@@ -310,6 +374,10 @@ class Library:
         stamp = now()
         added, updated = [], 0
         inbox_budget = max(0, int(self.engine.settings.initialInboxCount)) if first_fetch else None
+        if first_fetch:
+            # Feeds list newest-first almost always, but not always; the
+            # inbox budget must go to the newest episodes regardless.
+            episodes = sorted(episodes, key=lambda ep: -(ep["pub_date"] or 0))
         for ep in episodes:
             existing = known.get(ep["guid"])
             values = (
@@ -407,7 +475,9 @@ class Library:
         if changed:
             self.broadcast_inbox()
             self.broadcast_library()
-            self.engine.emit("queue-dirty", {})
+            queue = getattr(self.engine, "queue", None)
+            if queue is not None:
+                queue.broadcast()
         return {"changed": changed}
 
     def set_state(self, episode_ids, state):

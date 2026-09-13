@@ -26,9 +26,13 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "io.github.hominluo.podcast"
   readonly property string pluginVersion: manifest && manifest.version ? String(manifest.version) : ""
+  // Mirrors engine/config.py: XDG_RUNTIME_DIR, else the same temp dir Python
+  // would pick.
   readonly property string runtimeDir: {
     var dir = Quickshell.env("XDG_RUNTIME_DIR")
-    return dir && dir !== "" ? dir : "/tmp"
+    if (dir && dir !== "") return dir
+    var tmp = Quickshell.env("TMPDIR") || Quickshell.env("TEMP") || Quickshell.env("TMP")
+    return tmp && tmp !== "" ? tmp.replace(/\/+$/, "") : "/tmp"
   }
   readonly property string socketPath: runtimeDir + "/omarchy-podcast/daemon.sock"
   readonly property string launcherPath: decodeURIComponent(String(Qt.resolvedUrl("podcastd.py")).replace(/^file:\/\//, ""))
@@ -122,11 +126,11 @@ Item {
   function _flush() {
     root._flushScheduled = false
     if (root._outbox.length === 0) return
-    if (!socket.connected) return           // kept; sent after the next hello
+    if (!root.connected || !root._socket) return   // kept until the handshake is done
     var data = root._outbox.join("\n") + "\n"
     root._outbox = []
-    socket.write(data)
-    socket.flush()
+    root._socket.write(data)
+    root._socket.flush()
   }
 
   function _ingest(line) {
@@ -185,62 +189,123 @@ Item {
   }
 
   // ---- connection lifecycle ----------------------------------------------
-  Socket {
-    id: socket
-    path: root.socketPath
-    connected: false
-    parser: SplitParser {
-      onRead: function(line) { root._ingest(line) }
-    }
-    onConnectedChanged: {
-      if (socket.connected) {
-        root._retryMs = 250
-        root.connection = "connecting"
-        // Hello goes out alone so the daemon sees it first; queued requests
-        // follow on the next tick, after the handshake reply.
-        socket.write(JSON.stringify({ id: 0, cmd: "hello", client: "service", protocol: 1, pluginVersion: root.pluginVersion }) + "\n")
-        socket.flush()
-        var handshake = root._pending
-        handshake[0] = function(ok, result) {
-          if (!ok) { console.warn("podcast: handshake refused:", JSON.stringify(result)); socket.connected = false; return }
-          root.engineVersion = result && result.engineVersion ? String(result.engineVersion) : ""
-          root.connection = "connected"
-          root._lastPong = Date.now()
-          root.pushSettings(true)
-          root._flush()
-        }
-        root._pending = handshake
-      } else {
-        root._onDisconnected()
+  // Quickshell 0.3.1 keeps the QLocalSocket of a failed attempt inside the
+  // Socket (setConnected(true) is guarded by socket == nullptr and a failed
+  // connect never emits disconnected()), so a Socket that failed once can
+  // never be asked to connect again: every attempt gets a fresh one.
+  property var _socket: null
+  Component {
+    id: socketComponent
+    Socket {
+      id: socket
+      path: root.socketPath
+      connected: false
+      parser: SplitParser {
+        onRead: function(line) { if (root._socket === socket) root._ingest(line) }
       }
+      onConnectedChanged: {
+        if (root._socket !== socket) return   // a replaced attempt being torn down
+        attemptTimer.stop()
+        if (socket.connected) {
+          root._retryMs = 250
+          root.connection = "connecting"
+          // Hello goes out alone so the daemon sees it first; queued requests
+          // follow on the next tick, after the handshake reply.
+          socket.write(JSON.stringify({ id: 0, cmd: "hello", client: "service", protocol: 1, pluginVersion: root.pluginVersion }) + "\n")
+          socket.flush()
+          var handshake = root._pending
+          handshake[0] = function(ok, result) {
+            handshakeTimer.stop()
+            if (!ok) { console.warn("podcast: handshake refused:", JSON.stringify(result)); if (root._socket) root._socket.connected = false; return }
+            root.engineVersion = result && result.engineVersion ? String(result.engineVersion) : ""
+            root.connection = "connected"
+            root._lastPong = Date.now()
+            root.pushSettings(true)
+            root._flush()
+          }
+          root._pending = handshake
+          handshakeTimer.restart()
+        } else {
+          root._onDisconnected()
+        }
+      }
+      // A failed attempt reports only error (connected stays false); a drop of
+      // an established connection reports error first and then connected=false,
+      // and is handled once by onConnectedChanged.
+      onError: function(error) { if (root._socket === socket && !socket.connected) root._onDisconnected() }
     }
-    onError: function(error) { root._onDisconnected() }
+  }
+
+  function _disposeSocket() {
+    var old = root._socket
+    if (!old) return
+    root._socket = null
+    old.connected = false
+    old.destroy()
   }
 
   function _onDisconnected() {
-    if (root.connection !== "starting") root.connection = "connecting"
+    attemptTimer.stop()
+    handshakeTimer.stop()
+    var wasConnected = root.connection === "connected"
+    root.connection = "connecting"
+    // Callers waiting on an answer hear about the loss instead of hanging,
+    // and stale fire-and-forget requests do not replay on the next daemon.
+    var pending = root._pending
     root._pending = ({})
+    root._outbox = []
+    for (var id in pending) {
+      if (String(id) === "0") continue
+      try { pending[id](false, { code: "disconnected", message: "The player service is not connected" }) }
+      catch (e) { console.warn("podcast: callback failed:", e) }
+    }
+    if (!wasConnected) {
+      // The attempt itself failed: nothing is listening, so start the daemon
+      // (a second copy just exits when it finds the lock taken).
+      var now = Date.now()
+      if (now - root._lastSpawn > 3000) {
+        root._lastSpawn = now
+        root.connection = "starting"
+        Quickshell.execDetached(["python3", root.launcherPath, "serve"])
+      }
+    }
     reconnectTimer.interval = root._retryMs
     reconnectTimer.restart()
     root._retryMs = Math.min(4000, root._retryMs * 2)
   }
 
-  function _connectOrSpawn() {
-    if (socket.connected) return
-    var now = Date.now()
-    if (now - root._lastSpawn > 3000) {
-      root._lastSpawn = now
-      root.connection = "starting"
-      Quickshell.execDetached(["python3", root.launcherPath, "serve"])
-    }
-    socket.connected = true
+  function _connect() {
+    if (root._socket && root._socket.connected) return
+    root._disposeSocket()
+    attemptTimer.restart()                       // before the attempt: it may fail synchronously
+    root._socket = socketComponent.createObject(root)
+    root._socket.connected = true
   }
 
   Timer {
     id: reconnectTimer
     interval: 250
     repeat: false
-    onTriggered: root._connectOrSpawn()
+    onTriggered: root._connect()
+  }
+
+  // An attempt that neither connects nor errors is treated as failed.
+  Timer {
+    id: attemptTimer
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!root._socket || !root._socket.connected) root._onDisconnected()
+      else if (!root.connected) root._socket.connected = false
+    }
+  }
+
+  // A daemon that accepted the connection but never answered hello.
+  Timer {
+    id: handshakeTimer
+    interval: 5000
+    repeat: false
+    onTriggered: { if (!root.connected && root._socket) { console.warn("podcast: handshake timed out"); root._socket.connected = false } }
   }
 
   // Keepalive: a daemon that stops answering gets reconnected rather than
@@ -250,7 +315,7 @@ Item {
     repeat: true
     running: root.connected
     onTriggered: {
-      if (Date.now() - root._lastPong > 40000) { socket.connected = false; return }
+      if (Date.now() - root._lastPong > 40000) { if (root._socket) root._socket.connected = false; return }
       root.request("ping", {}, function(ok) { if (ok) root._lastPong = Date.now() })
     }
   }
@@ -313,7 +378,12 @@ Item {
   }
 
   // ---- playback ----------------------------------------------------------
-  function play(episodeId, callback) { root.request("play", { episodeId: episodeId }, callback) }
+  // `pos` (seconds) starts there instead of the saved position.
+  function play(episodeId, pos, callback) {
+    var params = { episodeId: episodeId }
+    if (pos !== undefined && pos !== null) params.pos = Number(pos) || 0
+    root.request("play", params, callback)
+  }
   function pause() { root.request("pause", {}) }
   function resume() { root.request("resume", {}) }
   function togglePause() { root.request("toggle", {}) }
@@ -326,6 +396,12 @@ Item {
     var params = { speed: speed }
     if (podcastId !== undefined && podcastId !== null) params.podcastId = podcastId
     root.request("set-speed", params)
+  }
+  // "Adjust what is playing": a podcast with its own speed override gets the
+  // override changed; otherwise the global speed moves.
+  function setCurrentSpeed(speed) {
+    var p = root.nowPlaying && root.nowPlaying.podcast ? root.nowPlaying.podcast : null
+    root.setSpeed(speed, p && p.speed ? p.id : undefined)
   }
   function setVolume(volume) { root.request("set-volume", { volume: volume }) }
   function next() { root.request("next", {}) }

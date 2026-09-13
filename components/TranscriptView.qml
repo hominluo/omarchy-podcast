@@ -108,7 +108,7 @@ Item {
   function seekTo(index) {
     var seg = root.segments[index]
     if (!seg || !service) return
-    if (!isCurrent) { service.request("set-position", { episodeId: episodeId, pos: Number(seg.startTime) || 0 }); service.play(episodeId) }
+    if (!isCurrent) service.play(episodeId, Number(seg.startTime) || 0)
     else service.seek(Number(seg.startTime) || 0)
     following = true
   }
@@ -207,7 +207,7 @@ Item {
   PlaybackClock {
     id: clock
     service: root.service
-    running: root.visible && root.isCurrent
+    running: root.visible && root.isCurrent && (!root.browser || root.browser.opened)
   }
 
   onSegmentsChanged: updateCurrent()

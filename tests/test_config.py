@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 
+import engine
 from engine import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,13 @@ class ManifestDefaultsTest(unittest.TestCase):
             manifest = json.load(handle)
         defaults = manifest["barWidget"]["defaults"]
         self.assertEqual(defaults, config.FALLBACK_DEFAULTS)
+
+    def test_manifest_version_matches_engine(self):
+        # The engine restarts itself when the plugin folder is newer than the
+        # code in memory; the two must agree or it would restart in a loop.
+        with open(os.path.join(PLUGIN_DIR, "manifest.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        self.assertEqual(manifest["version"], engine.VERSION)
 
     def test_schema_covers_every_default(self):
         with open(os.path.join(PLUGIN_DIR, "manifest.json"), encoding="utf-8") as handle:

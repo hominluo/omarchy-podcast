@@ -11,6 +11,7 @@ finds its transcripts again.
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 
@@ -39,12 +40,24 @@ def new_document(source, source_type="", language="", timed=True, status="comple
 
 
 def segment(start, end, body, speaker=""):
+    start = _finite(start, 0.0)
+    end = _finite(end, None) if end is not None else None
     return {
-        "startTime": round(float(start), 3),
-        "endTime": round(float(end), 3) if end is not None else None,
+        "startTime": round(start, 3),
+        "endTime": round(end, 3) if end is not None else None,
         "speaker": str(speaker or "").strip(),
         "body": " ".join(str(body or "").split()),
     }
+
+
+def _finite(value, fallback):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if math.isnan(number) or math.isinf(number):
+        return fallback
+    return max(0.0, number)
 
 
 def load(path):

@@ -23,6 +23,11 @@ from . import htmlclean, log
 LOG = log.get("feeds")
 
 MAX_ITEMS = 500
+# Feeds are parsed with items cleared as they go; everything else stays in
+# the tree, so a document that is nothing but elements is capped outright.
+MAX_ELEMENTS_OUTSIDE_ITEMS = 100000
+MAX_TITLE = 400
+MAX_TEXT_FIELD = 2000
 
 NS_ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 NS_PODCAST = {
@@ -88,27 +93,31 @@ def _attr(elem, *names):
     return ""
 
 
+MAX_DURATION = 100 * 3600
+
+
 def parse_duration(raw):
-    """'1:02:03' -> 3723, '45:10' -> 2710, '3600' -> 3600, '12.5' -> 12."""
+    """'1:02:03' -> 3723, '45:10' -> 2710, '3600' -> 3600, '12.5' -> 12.
+    Anything absurd (more than 100 hours, or numbers too long to be a time)
+    is treated as unknown rather than trusted."""
     text = str(raw or "").strip()
-    if not text:
+    if not text or len(text) > 32:
         return None
-    if re.fullmatch(r"\d+(\.\d+)?", text):
-        try:
+    try:
+        if re.fullmatch(r"\d{1,9}(\.\d+)?", text):
             value = int(float(text))
-            return value if value >= 0 else None
-        except ValueError:
-            return None
-    match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:\.\d+)?", text)
-    if match:
-        hours = int(match.group(1) or 0)
-        minutes = int(match.group(2))
-        seconds = int(match.group(3))
-        return hours * 3600 + minutes * 60 + seconds
-    match = re.search(r"(\d+)\s*(?:h|hr|hours?)", text, re.I)
-    match2 = re.search(r"(\d+)\s*(?:m|min|minutes?)", text, re.I)
-    if match or match2:
-        return (int(match.group(1)) * 3600 if match else 0) + (int(match2.group(1)) * 60 if match2 else 0)
+            return value if 0 <= value <= MAX_DURATION else None
+        match = re.fullmatch(r"(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2})(?:\.\d+)?", text)
+        if match:
+            value = int(match.group(1) or 0) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+            return value if value <= MAX_DURATION else None
+        match = re.search(r"(\d{1,3})\s*(?:h|hr|hours?)", text, re.I)
+        match2 = re.search(r"(\d{1,4})\s*(?:m|min|minutes?)", text, re.I)
+        if match or match2:
+            value = (int(match.group(1)) * 3600 if match else 0) + (int(match2.group(1)) * 60 if match2 else 0)
+            return value if value <= MAX_DURATION else None
+    except (ValueError, OverflowError):
+        return None
     return None
 
 
@@ -148,7 +157,12 @@ def parse_date(raw):
 def _to_epoch(value):
     if value.tzinfo is None:
         value = value.replace(tzinfo=datetime.timezone.utc)
-    return int(value.timestamp())
+    try:
+        stamp = int(value.timestamp())
+    except (OverflowError, ValueError, OSError):
+        return None
+    # Before 1980 or after 2200 is a broken clock, not a publication date.
+    return stamp if 315532800 <= stamp <= 7258118400 else None
 
 
 def _http_url(value):
@@ -157,10 +171,15 @@ def _http_url(value):
 
 
 def _int(value):
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
+    text = str(value).strip()
+    if not re.fullmatch(r"-?\d{1,15}", text):
         return None
+    return int(text)
+
+
+def _clip(text, limit):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit]
 
 
 def _explicit(value):
@@ -222,10 +241,15 @@ def _parse_bytes(payload, feed_url, max_items):
     item_depth = None
     is_atom = False
 
+    outside = 0
     for event, elem in iterator:
         family, name = _kind(elem)
         if event == "start":
             depth += 1
+            if item_depth is None:
+                outside += 1
+                if outside > MAX_ELEMENTS_OUTSIDE_ITEMS:
+                    raise FeedParseError("the feed has far too many elements to be a podcast feed")
             if root is None:
                 root = elem
                 is_atom = name == "feed"
@@ -276,7 +300,7 @@ def _parse_channel(channel, is_atom):
         if name in ("item", "entry"):
             continue
         if name == "title" and not info["title"]:
-            info["title"] = _text(elem)
+            info["title"] = _clip(_text(elem), MAX_TITLE)
         elif name == "link" and family in ("plain", "other"):
             info["link"] = _http_url(_text(elem)) or info["link"]
         elif name == "link" and family == "atom":
@@ -290,7 +314,7 @@ def _parse_channel(channel, is_atom):
         elif name == "summary" and family == "itunes":
             summary = _text(elem)
         elif name == "author" and family == "itunes":
-            info["author"] = info["author"] or _text(elem)
+            info["author"] = info["author"] or _clip(_text(elem), MAX_TITLE)
         elif name == "author" and family == "atom":
             child = None
             for sub in elem:
@@ -349,7 +373,7 @@ def _parse_item(item, is_atom):
     for elem in list(item):
         family, name = _kind(elem)
         if name == "title" and not ep["title"]:
-            ep["title"] = _text(elem)
+            ep["title"] = _clip(_text(elem), MAX_TITLE)
         elif name == "guid" or (name == "id" and family == "atom"):
             guid = _text(elem)
         elif name == "link" and family == "atom":
@@ -413,7 +437,7 @@ def _parse_item(item, is_atom):
                 })
         elif name == "person" and family == "podcast":
             person = {
-                "name": _text(elem),
+                "name": _clip(_text(elem), 200),
                 "role": _attr(elem, "role").lower() or "host",
                 "group": _attr(elem, "group").lower() or "cast",
                 "img": _http_url(_attr(elem, "img")),
@@ -426,7 +450,7 @@ def _parse_item(item, is_atom):
     if chosen is None:
         return None
     ep["enclosure_url"], ep["enclosure_type"], ep["enclosure_length"] = chosen
-    ep["guid"] = guid or ep["enclosure_url"]
+    ep["guid"] = _clip(guid, MAX_TEXT_FIELD) or ep["enclosure_url"]
 
     rich, text = htmlclean.clean(encoded or description or summary)
     ep["notes_html"] = rich

@@ -38,6 +38,20 @@ CHUNK_SECONDS = 600
 OVERLAP_SECONDS = 4
 VRAM_FOR_TURBO = 1.5 * 1024 ** 3
 DEFAULT_MAX_LEN = 60
+# Language codes whisper.cpp accepts with -l (its whisper_lang_id table).
+LANGUAGES = frozenset("""
+en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro da hu ta no th ur hr bg lt la mi ml cy
+sk te fa lv bn sr az sl kn et mk br eu is hy ne mn bs kk sq sw gl mr pa si km sn yo so af oc ka be tg sd gu am yi lo
+uz fo ht ps tk nn mt sa lb my bo tl mg as tt haw ln ha ba jw su yue
+""".split())
+
+
+def normalize_language(value):
+    """A feed's language tag reduced to a code whisper knows, else 'auto'."""
+    code = str(value or "").strip().lower().replace("_", "-").split("-")[0]
+    if code == "iw":
+        code = "he"
+    return code if code in LANGUAGES else "auto"
 
 
 class TranscribeError(Exception):
@@ -178,11 +192,15 @@ def convert_to_wav(source, wav_path, cancel=None):
     Returns the duration in seconds."""
     argv = _nice(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", source, "-vn", "-ac", "1", "-ar", "16000",
                   "-c:a", "pcm_s16le", "-f", "wav", wav_path])
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    _wait(process, cancel)
-    if process.returncode != 0:
-        err = (process.stderr.read() if process.stderr else b"").decode("utf-8", "replace").strip()
-        raise TranscribeError("ffmpeg could not read the audio: %s" % (err.splitlines()[-1] if err else "unknown error"))
+    # stderr goes to a file, never a pipe: _wait does not drain, and a damaged
+    # file makes ffmpeg print one line per bad frame.
+    with tempfile.TemporaryFile(prefix="ffmpeg-stderr-") as errlog:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
+        _wait(process, cancel)
+        if process.returncode != 0:
+            errlog.seek(0)
+            err = errlog.read()[-4096:].decode("utf-8", "replace").strip()
+            raise TranscribeError("ffmpeg could not read the audio: %s" % (err.splitlines()[-1][:200] if err else "exit %d" % process.returncode))
     try:
         size = os.path.getsize(wav_path)
     except OSError:
@@ -191,6 +209,7 @@ def convert_to_wav(source, wav_path, cancel=None):
 
 
 def _wait(process, cancel):
+    # Polls; never hand the child a PIPE, nothing here drains it.
     while True:
         try:
             process.wait(timeout=0.25)
@@ -215,11 +234,13 @@ def transcribe_chunk(binary, model_file, wav_path, offset_seconds, duration_seco
                 "-ml", str(DEFAULT_MAX_LEN), "-sow", "-np", "-t", str(max(1, threads))]
         if not gpu:
             argv.append("-ng")
-        process = subprocess.Popen(_nice(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        _wait(process, cancel)
-        if process.returncode != 0:
-            err = (process.stderr.read() if process.stderr else b"").decode("utf-8", "replace").strip()
-            raise TranscribeError("whisper-cli failed: %s" % (err.splitlines()[-1][:200] if err else "exit %d" % process.returncode))
+        with open(os.path.join(tmp, "stderr"), "w+b") as errlog:
+            process = subprocess.Popen(_nice(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
+            _wait(process, cancel)
+            if process.returncode != 0:
+                errlog.seek(0)
+                err = errlog.read()[-4096:].decode("utf-8", "replace").strip()
+                raise TranscribeError("whisper-cli failed: %s" % (err.splitlines()[-1][:200] if err else "exit %d" % process.returncode))
         try:
             with open(base + ".json", "r", encoding="utf-8") as handle:
                 payload = json.load(handle)

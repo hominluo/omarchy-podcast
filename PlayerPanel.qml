@@ -147,6 +147,14 @@ Panel {
   function cycleSpeed(direction) { transport.cycleSpeed(direction) }
   function cycleSleep() { transport.cycleSleep() }
 
+  // Tab/Shift+Tab walk to the neighbouring bar panel, the host way.
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function") {
+      if (root.bar.switchPanelFrom(root.barIdentity, direction)) return
+    }
+    root.close()
+  }
+
   function browse(view) {
     root.close()
     if (service) service.browse(view, hasEpisode && view === "nowPlaying" ? { episodeId: player.episodeId } : null)

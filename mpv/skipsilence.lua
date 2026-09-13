@@ -49,7 +49,7 @@ local state = {
   in_silence = false,
   silence_started = nil,   -- mp.get_time() when silence began
   timer = nil,
-  applying = false,        -- true while this script itself sets `speed`
+  pending = {},            -- speeds this script set whose change events are still due
   filter_added = false,
 }
 
@@ -65,9 +65,25 @@ local function publish()
 end
 
 local function set_speed(value)
-  state.applying = true
+  -- Property-change events arrive later, so a flag around set_property
+  -- cannot tell our writes from the user's: remember the values instead.
+  -- A write that leaves the value unchanged produces no event at all, so
+  -- recording it would leave an entry behind that later eats a real change.
+  local current = mp.get_property_number("speed")
+  if current and math.abs(current - value) < 0.0005 then return end
+  table.insert(state.pending, value)
+  if #state.pending > 32 then table.remove(state.pending, 1) end
   mp.set_property_number("speed", value)
-  state.applying = false
+end
+
+local function take_pending(value)
+  for index, ours in ipairs(state.pending) do
+    if math.abs(ours - value) < 0.0005 then
+      table.remove(state.pending, index)
+      return true
+    end
+  end
+  return false
 end
 
 local function filter_spec()
@@ -136,10 +152,12 @@ local function on_log(event)
 end
 
 local function on_speed(_, value)
-  if state.applying or value == nil then return end
+  if value == nil or take_pending(value) then return end
   -- Somebody else (the daemon, a key binding) changed the speed: that is the
   -- new base speed, whether or not we are mid-ramp.
   if not state.in_silence then
+    -- An external change while idle: whatever we still had in flight is stale.
+    state.pending = {}
     state.base_speed = value
     publish()
   end

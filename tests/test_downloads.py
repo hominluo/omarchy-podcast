@@ -61,18 +61,24 @@ class DownloadTest(unittest.TestCase):
                 # First attempt: server drops the connection half way.
                 self.http.fail_after_bytes = 300 * 1024
                 h.engine.downloads.request([ep["id"]])
-                path = await asyncio.wait_for(h.engine.downloads.wait_for(ep["id"]), 20)
-                self.assertIsNone(path)  # first attempt failed, retry pending
-                row = h.engine.store.one("SELECT status, attempts, temp_path FROM downloads WHERE episode_id = ?", (ep["id"],))
+                waiter = asyncio.ensure_future(h.engine.downloads.wait_for(ep["id"]))
+                # The first attempt fails and a retry is scheduled; waiters
+                # stay pending across retries, so poll the row instead.
+                for _ in range(400):
+                    row = h.engine.store.one("SELECT status, attempts, temp_path FROM downloads WHERE episode_id = ?", (ep["id"],))
+                    if row["attempts"] == 1 and row["status"] == "queued":
+                        break
+                    await asyncio.sleep(0.05)
                 self.assertEqual(row["status"], "queued")
                 self.assertEqual(row["attempts"], 1)
+                self.assertFalse(waiter.done())
                 self.assertTrue(os.path.exists(row["temp_path"]))
                 partial = os.path.getsize(row["temp_path"])
                 self.assertGreater(partial, 0)
                 # Let it resume right away rather than after the retry delay.
                 self.http.fail_after_bytes = None
                 h.engine.downloads._enqueue(ep["id"], 1, 0)
-                path = await asyncio.wait_for(h.engine.downloads.wait_for(ep["id"]), 20)
+                path = await asyncio.wait_for(waiter, 20)
                 self.assertTrue(path and os.path.exists(path))
                 with open(path, "rb") as handle:
                     self.assertEqual(handle.read(), self.audio)
@@ -102,6 +108,27 @@ class DownloadTest(unittest.TestCase):
                 result = h.engine.downloads.cleanup()
                 self.assertEqual(result["removed"], 1)
                 self.assertFalse(os.path.exists(path))
+        run(scenario())
+
+    def test_unclean_shutdown_resumes_downloading_rows(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                h.engine.settings.update({"downloadDir": os.path.join(h.tmp.name, "music")})
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                ep = h.engine.library.episodes_page(podcast["id"])["items"][0]
+                # A crash mid-transfer leaves the row 'downloading' with no job.
+                h.engine.store.execute(
+                    "INSERT INTO downloads (episode_id, status, keep, path, temp_path, bytes_done, bytes_total, attempts, error, created_at) "
+                    "VALUES (?, 'downloading', 1, '', '', 0, 0, 0, '', 1)", (ep["id"],))
+                downloads = h.engine.downloads
+                await downloads.stop()
+                downloads.jobs.clear()
+                downloads._workers.clear()
+                h.engine.store.execute("UPDATE downloads SET status = 'downloading' WHERE episode_id = ?", (ep["id"],))
+                await downloads.start()
+                path = await asyncio.wait_for(downloads.wait_for(ep["id"]), 20)
+                self.assertTrue(path and os.path.exists(path))
+                self.assertEqual(h.engine.store.scalar("SELECT status FROM downloads WHERE episode_id = ?", (ep["id"],)), "done")
         run(scenario())
 
 

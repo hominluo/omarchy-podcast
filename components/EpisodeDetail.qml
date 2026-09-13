@@ -226,7 +226,9 @@ Item {
           width: parent.width
           implicitHeight: chapterText.implicitHeight + Style.spacing.md
           foreground: root.foreground
-          current: root.service && root.service.player && root.service.player.chapter === index
+          // Merged chapters do not share mpv's chapter numbering, so the
+          // current one is found by time.
+          current: root.isCurrent && Model.chapterIndexAt(root.chapters, root.service.player.pos) === index
 
           MouseArea {
             anchors.fill: parent
@@ -269,7 +271,7 @@ Item {
       id: notes
       width: parent.width
       height: parent.height - y
-      html: root.detail && root.detail.notesHtml !== undefined ? String(root.detail.notesHtml) : (root.record ? "<p>" + String(root.record.notesText || "") + "</p>" : "")
+      html: root.detail && root.detail.notesHtml !== undefined ? String(root.detail.notesHtml) : (root.record ? "<p>" + Model.escapeHtml(root.record.notesText || "") + "</p>" : "")
       foreground: root.foreground
       fontFamily: root.fontFamily
     }

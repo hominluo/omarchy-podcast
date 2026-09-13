@@ -25,6 +25,7 @@ class Job:
         self.fn = fn
         self.next_at = time.monotonic() + initial_delay
         self.running = False
+        self.task = None
 
 
 class Scheduler:
@@ -44,12 +45,16 @@ class Scheduler:
         self._task = asyncio.ensure_future(self._run())
 
     async def stop(self, restart=False, quit_mpv=True):
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        tasks = [self._task] + [job.task for job in self.jobs]
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        for task in tasks:
+            if task and not task.done():
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
     async def _run(self):
         while True:
@@ -60,7 +65,7 @@ class Scheduler:
                     continue
                 job.next_at = stamp + job.interval
                 job.running = True
-                asyncio.ensure_future(self._run_job(job))
+                job.task = asyncio.ensure_future(self._run_job(job))
 
     async def _run_job(self, job):
         try:
@@ -73,6 +78,7 @@ class Scheduler:
             LOG.exception("job %s failed", job.name)
         finally:
             job.running = False
+            job.task = None
 
     def kick(self, name):
         """Run a job on the next tick regardless of its schedule."""

@@ -67,11 +67,31 @@ Item {
     if (cursorIndex >= items.length) cursorIndex = Math.max(0, items.length - 1)
   }
 
+  // A patched array is a new model to the ListView, which scrolls back to the
+  // top. The last settled position is remembered (deferred, so the reset does
+  // not overwrite it) and restored right after the swap.
+  property real _settledY: 0
+  property bool _swapping: false
+  function _captureY() { if (!root._swapping) root._settledY = list.contentY }
+  // Hosts call this before handing over a genuinely different list (search,
+  // filter) so the old list's offset is not applied to it.
+  function resetScroll() { root._settledY = 0 }
+
   ListView {
     id: list
     anchors.fill: parent
     model: root.items
     clip: true
+    onContentYChanged: Qt.callLater(root._captureY)
+    onModelChanged: {
+      var y = root._settledY
+      root._swapping = true
+      Qt.callLater(function() {
+        if (y > 0 && list.contentHeight > list.height && y <= list.contentHeight - list.height) list.contentY = y
+        root._settledY = list.contentY   // follows every swap, restored or not
+        root._swapping = false
+      })
+    }
     spacing: Style.spacing.xxs
     boundsBehavior: Flickable.StopAtBounds
     cacheBuffer: Style.space(600)

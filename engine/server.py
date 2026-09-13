@@ -9,6 +9,7 @@ than allowed to grow the buffer without bound.
 
 import asyncio
 import json
+import math
 import os
 import stat
 
@@ -31,12 +32,14 @@ class Client:
         self.closed = False
         self.number = Client._next_id
         Client._next_id += 1
+        self.tasks = set()            # in-flight requests
+        self._drain_lock = asyncio.Lock()
 
     def send(self, payload):
         if self.closed:
             return
         try:
-            self.writer.write((json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+            self.writer.write((encode(payload) + "\n").encode("utf-8"))
         except (OSError, RuntimeError):
             self.closed = True
 
@@ -44,7 +47,8 @@ class Client:
         if self.closed:
             return
         try:
-            await self.writer.drain()
+            async with self._drain_lock:
+                await self.writer.drain()
         except (OSError, ConnectionError, RuntimeError):
             self.closed = True
 
@@ -58,6 +62,9 @@ class Client:
         if self.closed:
             return
         self.closed = True
+        # In-flight requests run to completion: a subscribe or refresh whose
+        # requester went away (shell reload) must still finish. Replies to a
+        # closed client are dropped by send().
         try:
             self.writer.close()
         except (OSError, RuntimeError):
@@ -65,6 +72,26 @@ class Client:
 
     def __repr__(self):
         return "Client(%d, %s)" % (self.number, self.name or "?")
+
+
+def encode(payload):
+    """Compact JSON that a strict parser accepts: NaN and infinities (a
+    broken duration, a division somewhere) become null instead of poisoning
+    the whole line."""
+    try:
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _finite(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(item) for item in value]
+    return value
 
 
 class Server:
@@ -83,6 +110,8 @@ class Server:
 
     async def stop(self):
         for client in list(self.clients):
+            for task in list(client.tasks):
+                task.cancel()
             client.close()
         self.clients.clear()
         if self._server is not None:
@@ -152,8 +181,24 @@ class Server:
             line = raw.strip()
             if not line:
                 continue
+            if not client.greeted:
+                # The handshake is sequential; everything after it may overlap
+                # so a slow subscribe does not hold up a pause.
+                await self._handle_line(client, line)
+                await client.drain()
+                continue
+            task = asyncio.ensure_future(self._request(client, line))
+            client.tasks.add(task)
+            task.add_done_callback(client.tasks.discard)
+
+    async def _request(self, client, line):
+        try:
             await self._handle_line(client, line)
             await client.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            LOG.exception("%r request handler crashed", client)
 
     async def _handle_line(self, client, line):
         try:
@@ -183,14 +228,22 @@ class Server:
                 result = await cmd.handler(self.engine, client, **args)
             else:
                 result = cmd.handler(self.engine, client, **args)
+        except asyncio.CancelledError:
+            raise
         except protocol.ProtocolError as error:
             if request_id is not None:
                 client.fail(request_id, error)
+            else:
+                # Fire-and-forget request: the failure still deserves a face.
+                self.engine.notice("warn", error.message, code=error.code)
             return
         except Exception as error:  # noqa: BLE001 - report, never crash the server
             LOG.exception("command %r failed", name)
+            message = "%s: %s" % (type(error).__name__, error)
             if request_id is not None:
-                client.fail(request_id, protocol.ProtocolError(protocol.INTERNAL, "%s: %s" % (type(error).__name__, error)))
+                client.fail(request_id, protocol.ProtocolError(protocol.INTERNAL, message))
+            else:
+                self.engine.notice("error", "%s failed: %s" % (name, message), code=protocol.INTERNAL)
             return
         if request_id is not None:
             client.respond(request_id, result)
@@ -201,14 +254,17 @@ class Server:
             wanted = int(wanted)
         except (TypeError, ValueError):
             wanted = None
+        client.name = str(message.get("client") or "client")
+        client.plugin_version = str(message.get("pluginVersion") or "")
         if wanted != PROTOCOL:
             client.fail(request_id, protocol.ProtocolError(
                 protocol.CONFLICT, "protocol %s not supported (daemon speaks %d)" % (wanted, PROTOCOL), protocol=PROTOCOL))
             await client.drain()
             client.close()
+            # A plugin speaking a newer protocol is the cue to restart into
+            # its code, or the two would never meet.
+            self.engine.on_client_hello(client)
             return
-        client.name = str(message.get("client") or "client")
-        client.plugin_version = str(message.get("pluginVersion") or "")
         client.greeted = True
         client.respond(request_id, {
             "protocol": PROTOCOL,

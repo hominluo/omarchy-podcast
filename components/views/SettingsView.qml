@@ -33,8 +33,10 @@ Item {
     var current = root.settings || {}
     for (var key in current) if (key !== "id") entry[key] = current[key]
     for (var k in values) entry[k] = values[k]
-    browser.shell.updateEntryInline(browser.pluginId, entry)
-    root.notice = "Saved."
+    var changed = browser.shell.updateEntryInline(browser.pluginId, entry)
+    if (changed) root.notice = "Saved."
+    else if (JSON.stringify(entry) === JSON.stringify(Object.assign({ id: browser.pluginId }, current))) root.notice = "No changes."
+    else root.notice = "Could not save: the Podcast widget is not on the bar."
     noticeTimer.restart()
   }
 
@@ -521,7 +523,7 @@ Item {
       foreground: browser.foreground
       onActiveFocusChanged: browser.editing = activeFocus
       onEditingFinished: parent.committed(text.trim())
-      Keys.onPressed: function(event) { if (event.key === Qt.Key_Escape) { browser.refocus(); event.accepted = true } }
+      Keys.onPressed: function(event) { if (event.key === Qt.Key_Escape) { browser.editing = false; browser.refocus(); event.accepted = true } }
     }
   }
 }

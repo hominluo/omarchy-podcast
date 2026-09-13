@@ -32,6 +32,12 @@ FREE_SPACE_FACTOR = 2
 PRIORITY_USER, PRIORITY_AUTO, PRIORITY_CACHE = 0, 1, 2
 CACHE_MAX_AGE = 24 * 3600
 PART_MAX_AGE = 7 * 86400
+# A transfer may not exceed this many times the size the feed declared (or
+# this absolute size when it declared none): a chunked response that never
+# ends must not fill the disk.
+SIZE_SLACK = 4
+ABSOLUTE_CAP = 2 * 1024 ** 3
+STALL_SECONDS = 90
 
 EXTENSIONS = {
     "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/m4a": "m4a",
@@ -45,15 +51,13 @@ class Cancelled(Exception):
 
 
 def safe_name(value, limit=120):
-    text = unicodedata.normalize("NFC", str(value or "")).strip()
+    text = unicodedata.normalize("NFC", str(value or "")[:limit * 4]).strip()
     text = re.sub(r"[\x00-\x1f/\\<>:\"|?*]+", "_", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
     if not text:
         text = "untitled"
-    encoded = text.encode("utf-8")
-    while len(encoded) > limit:
-        text = text[:-1]
-        encoded = text.encode("utf-8")
+    # Cut on a UTF-8 boundary in one step rather than a character at a time.
+    text = text.encode("utf-8")[:limit].decode("utf-8", "ignore")
     return text.rstrip(" .") or "untitled"
 
 
@@ -69,11 +73,13 @@ def extension_for(mime, url):
 
 
 class Job:
-    def __init__(self, episode_id, keep, priority):
+    def __init__(self, episode_id, keep, priority, seq):
         self.episode_id = episode_id
         self.keep = keep
         self.priority = priority
-        self.cancel = None       # threading.Event-like object set from the loop
+        self.seq = seq           # ties the job to its queue entry
+        self.cancel = threading.Event()
+        self.started = False
         self.bytes_done = 0
         self.bytes_total = None
         self.rate = 0.0
@@ -97,8 +103,10 @@ class Downloads:
         self.queue = asyncio.PriorityQueue()
         self.engine.on_new_episodes_extra = self._on_new_episodes
         self.engine.housekeeping_hooks.append(self.cleanup)
-        # Whatever was in flight when the daemon last stopped goes back in line.
-        for row in self.store.all("SELECT episode_id, keep FROM downloads WHERE status IN ('queued', 'downloading') ORDER BY created_at"):
+        # Whatever was in flight when the daemon last stopped (cleanly or not)
+        # goes back in line.
+        self.store.execute("UPDATE downloads SET status = 'queued' WHERE status = 'downloading'")
+        for row in self.store.all("SELECT episode_id, keep FROM downloads WHERE status = 'queued' ORDER BY created_at"):
             self._enqueue(row["episode_id"], row["keep"], PRIORITY_AUTO if row["keep"] else PRIORITY_CACHE)
         for _ in range(WORKERS):
             self._workers.append(asyncio.ensure_future(self._worker()))
@@ -120,12 +128,15 @@ class Downloads:
     # ---- queueing ----------------------------------------------------------
 
     def _enqueue(self, episode_id, keep, priority):
-        if episode_id in self.jobs:
-            return self.jobs[episode_id]
-        job = Job(int(episode_id), int(keep), priority)
-        self.jobs[job.episode_id] = job
+        current = self.jobs.get(episode_id)
+        if current is not None:
+            # Either waiting in line, or a cancelled transfer whose thread may
+            # still hold the .part file: the worker re-enqueues when it drains.
+            return current
         self._seq += 1
-        self.queue.put_nowait((priority, self._seq, job.episode_id))
+        job = Job(int(episode_id), int(keep), priority, self._seq)
+        self.jobs[job.episode_id] = job
+        self.queue.put_nowait((priority, job.seq, job.episode_id))
         return job
 
     def request(self, episode_ids, keep=1, priority=PRIORITY_USER):
@@ -137,7 +148,7 @@ class Downloads:
             existing = self.store.one("SELECT status, keep, path FROM downloads WHERE episode_id = ?", (row["id"],))
             if existing is not None and existing["status"] == "done" and existing["path"] and os.path.exists(existing["path"]):
                 if keep and not existing["keep"]:
-                    self._promote(row["id"], existing["path"])
+                    asyncio.ensure_future(self._promote(row["id"], existing["path"]))
                     added.append(row["id"])
                 continue
             stamp = now()
@@ -169,19 +180,21 @@ class Downloads:
             if not future.done():
                 future.set_result(path)
 
-    def cancel(self, episode_ids):
+    def cancel(self, episode_ids, quiet=False):
         cancelled = []
         for episode_id in episode_ids:
             episode_id = int(episode_id)
             job = self.jobs.get(episode_id)
-            if job is not None and job.cancel is not None:
+            if job is not None:
                 job.cancel.set()
-            elif job is not None:
-                # Still waiting in line: drop the row, the worker skips it.
-                self.jobs.pop(episode_id, None)
+                if not job.started:
+                    # Still waiting in line: the worker skips the stale entry.
+                    self.jobs.pop(episode_id, None)
             self.store.execute("UPDATE downloads SET status = 'paused' WHERE episode_id = ? AND status IN ('queued', 'downloading')", (episode_id,))
             cancelled.append(episode_id)
             self._resolve_waiters(episode_id, None)
+        if quiet:
+            return {"cancelled": cancelled}
         self.broadcast()
         for episode_id in cancelled:
             self.engine.library.emit_episode(episode_id)
@@ -247,18 +260,20 @@ class Downloads:
 
     async def _worker(self):
         while True:
-            _, _, episode_id = await self.queue.get()
+            _, seq, episode_id = await self.queue.get()
             job = self.jobs.get(episode_id)
-            if job is None:
+            if job is None or job.seq != seq or job.cancel.is_set() or job.started:
                 continue
             row = self.store.one("SELECT status FROM downloads WHERE episode_id = ?", (episode_id,))
-            if row is None or row["status"] not in ("queued", "downloading"):
+            if row is None or row["status"] != "queued":
                 self.jobs.pop(episode_id, None)
                 continue
-            job.cancel = threading.Event()
+            job.started = True
             self.store.execute("UPDATE downloads SET status = 'downloading' WHERE episode_id = ?", (episode_id,))
             self.broadcast()
             self.engine.library.emit_episode(episode_id)
+            path = None
+            settled = True
             try:
                 plan = self._plan(job)
                 path = await self.engine.run_in_thread(self._download, job, plan)
@@ -266,15 +281,14 @@ class Downloads:
                                    (plan.get("etag"), plan.get("last_modified"), episode_id))
                 self._cover_for(plan)
             except Cancelled:
-                self.store.execute("UPDATE downloads SET status = 'paused', bytes_done = ? WHERE episode_id = ?", (job.bytes_done, episode_id))
-                path = None
+                self.store.execute("UPDATE downloads SET status = 'paused', bytes_done = ? WHERE episode_id = ? AND status = 'downloading'",
+                                   (job.bytes_done, episode_id))
             except http.FetchError as error:
-                path = None
-                await self._failed(job, error.message)
+                settled = await self._failed(job, error.message)
             except Exception as error:  # noqa: BLE001
-                LOG.exception("download of episode %d crashed", episode_id)
-                path = None
-                await self._failed(job, "%s: %s" % (type(error).__name__, error))
+                if not job.cancel.is_set():
+                    LOG.exception("download of episode %d crashed", episode_id)
+                settled = await self._failed(job, "%s: %s" % (type(error).__name__, error))
             else:
                 self.store.execute(
                     "UPDATE downloads SET status = 'done', path = ?, temp_path = '', bytes_done = ?, bytes_total = ?, finished_at = ?, error = '' WHERE episode_id = ?",
@@ -288,8 +302,19 @@ class Downloads:
                         hook(episode_id, job.keep)
                     except Exception:  # noqa: BLE001
                         LOG.exception("download hook failed")
-            self.jobs.pop(episode_id, None)
-            self._resolve_waiters(episode_id, path)
+            if self.jobs.get(episode_id) is job:
+                self.jobs.pop(episode_id, None)
+            if job.cancel.is_set():
+                # Re-requested while the cancelled transfer drained: its thread
+                # has exited now, so the .part file is free again.
+                state = self.store.one("SELECT status, keep FROM downloads WHERE episode_id = ?", (episode_id,))
+                if state is not None and state["status"] == "queued":
+                    self._enqueue(episode_id, state["keep"], job.priority)
+                    settled = False
+            if settled:
+                # A retry keeps the waiters (the transcriber) pending; only a
+                # final outcome resolves them.
+                self._resolve_waiters(episode_id, path)
             self.broadcast()
             self.engine.library.emit_episode(episode_id)
             playback = getattr(self.engine, "playback", None)
@@ -297,18 +322,35 @@ class Downloads:
                 playback.broadcast_now_playing()
 
     async def _failed(self, job, message):
+        """Returns True when the failure is final, False when a retry is due."""
+        if job.cancel.is_set():
+            # cancel() or an unsubscribe already settled the row ('paused' or
+            # gone); the thread merely noticed late.
+            LOG.info("download of episode %d cancelled (%s)", job.episode_id, message)
+            return True
         row = self.store.one("SELECT attempts FROM downloads WHERE episode_id = ?", (job.episode_id,))
         attempts = int(row["attempts"] or 0) + 1 if row else 1
         if attempts <= len(RETRY_DELAYS):
             delay = RETRY_DELAYS[attempts - 1]
             LOG.warning("download of episode %d failed (%s); retry in %ds", job.episode_id, message, delay)
             self.store.execute("UPDATE downloads SET attempts = ?, error = ?, status = 'queued' WHERE episode_id = ?", (attempts, message[:200], job.episode_id))
-            self.engine.loop.call_later(delay, self._enqueue, job.episode_id, job.keep, job.priority)
-            return
+            self.engine.loop.call_later(delay, self._retry, job.episode_id, job.keep, job.priority)
+            return False
         LOG.error("download of episode %d gave up: %s", job.episode_id, message)
         self.store.execute("UPDATE downloads SET attempts = ?, error = ?, status = 'error' WHERE episode_id = ?", (attempts, message[:200], job.episode_id))
         title = self.store.scalar("SELECT title FROM episodes WHERE id = ?", (job.episode_id,), default="episode")
         self.engine.notice("error", "Download failed: %s (%s)" % (str(title)[:50], message), episode_id=job.episode_id)
+        return True
+
+    def _retry(self, episode_id, keep, priority):
+        row = self.store.one("SELECT status FROM downloads WHERE episode_id = ?", (episode_id,))
+        if row is not None and row["status"] == "queued":
+            self._enqueue(episode_id, keep, priority)
+        elif row is None or row["status"] in ("error", "paused"):
+            # Nothing will finish this one; do not leave the transcriber hanging.
+            self._resolve_waiters(episode_id, None)
+        # 'downloading' / 'done': a replacement started by request() during the
+        # delay owns the waiters and settles them itself.
 
     # ---- the blocking transfer --------------------------------------------
 
@@ -322,10 +364,14 @@ class Downloads:
             folder = self.engine.paths.audio_dir
             base = "%d-%s" % (row["id"], safe_name(row["title"], 60))
         os.makedirs(folder, exist_ok=True)
+        taken = set()
+        for other in self.store.all("SELECT path, temp_path FROM downloads WHERE episode_id != ?", (row["id"],)):
+            for value in (other["path"], other["temp_path"]):
+                if value:
+                    taken.add(value)
         path = os.path.join(folder, base + "." + ext)
         counter = 2
-        existing = self.store.scalar("SELECT path FROM downloads WHERE episode_id = ?", (row["id"],), default="")
-        while os.path.exists(path) and path != existing:
+        while os.path.exists(path) or path in taken or (path + ".part") in taken:
             path = os.path.join(folder, "%s (%d).%s" % (base, counter, ext))
             counter += 1
         return path
@@ -380,21 +426,30 @@ class Downloads:
             job.bytes_total = total
             plan["etag"] = response.headers.get("ETag")
             plan["last_modified"] = response.headers.get("Last-Modified")
+            expected = total or int(plan.get("expected") or 0)
+            cap = max(expected * SIZE_SLACK, ABSOLUTE_CAP if not expected else 0) or ABSOLUTE_CAP
             last_rate_at = time.monotonic()
             last_rate_bytes = job.bytes_done
+            last_progress_at = last_rate_at
             with open(part, mode) as handle:
                 while True:
                     if job.cancel.is_set():
                         raise Cancelled()
-                    chunk = response.read(CHUNK)
+                    chunk = http.read_chunk(response)
                     if not chunk:
                         break
                     handle.write(chunk)
                     job.bytes_done += len(chunk)
+                    if job.bytes_done > cap:
+                        raise http.FetchError("too-large", "the file is far larger than the feed said")
                     stamp = time.monotonic()
                     if stamp - last_rate_at >= 1.0:
                         job.rate = (job.bytes_done - last_rate_bytes) / (stamp - last_rate_at)
                         last_rate_at, last_rate_bytes = stamp, job.bytes_done
+                        if job.rate < 256 and stamp - last_progress_at > STALL_SECONDS:
+                            raise http.FetchError("network", "the server stopped sending")
+                        if job.rate >= 256:
+                            last_progress_at = stamp
                     self.engine.call_soon(self._progress, job)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -428,20 +483,30 @@ class Downloads:
         except OSError:
             pass
 
-    def _promote(self, episode_id, cache_path):
-        """A cache-only file the user now wants to keep: move it into the library."""
+    async def _promote(self, episode_id, cache_path):
+        """A cache-only file the user now wants to keep: move it into the
+        library. The move may be a copy across filesystems, so it runs off
+        the loop thread."""
         row = self.store.one(models.EPISODE_SELECT + " WHERE e.id = ?", (episode_id,))
         if row is None:
             return
         target = self._target_path(row, 1)
-        try:
+        # Reserve the path now so a concurrent download cannot pick it.
+        self.store.execute("UPDATE downloads SET keep = 1, path = ? WHERE episode_id = ?", (target, episode_id))
+
+        def move():
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.move(cache_path, target)
+
+        try:
+            await self.engine.run_in_thread(move)
         except OSError as error:
             LOG.warning("could not move %s into the library: %s", cache_path, error)
+            self.store.execute("UPDATE downloads SET keep = 0, path = ? WHERE episode_id = ?", (cache_path, episode_id))
             return
-        self.store.execute("UPDATE downloads SET keep = 1, path = ? WHERE episode_id = ?", (target, episode_id))
         self.engine.library.record_action(episode_id, "download")
+        self.broadcast()
+        self.engine.library.emit_episode(episode_id)
 
     # ---- policy ------------------------------------------------------------
 

@@ -44,7 +44,7 @@ Item {
 
   function cycleSpeed(direction) {
     if (!service || !player) return
-    service.setSpeed(Model.nextSpeed(player.baseSpeed || player.speed, direction))
+    service.setCurrentSpeed(Model.nextSpeed(player.baseSpeed || player.speed, direction))
   }
 
   // Off -> default minutes -> 45 -> 60 -> end of episode -> end of chapter -> off.

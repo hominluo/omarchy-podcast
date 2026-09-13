@@ -314,7 +314,7 @@ Item {
             Layout.preferredWidth: Style.space(220)
             placeholderText: "Search episodes"
             foreground: browser.foreground
-            onTextChanged: { root.query = text; list.cursorIndex = 0 }
+            onTextChanged: { list.resetScroll(); root.query = text; list.cursorIndex = 0 }
             onActiveFocusChanged: if (!activeFocus && root.searching) root.endSearch(false)
             Keys.onPressed: function(event) {
               if (event.key === Qt.Key_Escape) { root.endSearch(true); event.accepted = true }
