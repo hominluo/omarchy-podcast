@@ -1,51 +1,12 @@
 import asyncio
 import json
 import os
-import tempfile
 import unittest
 
 from engine import PROTOCOL, VERSION, protocol
-from engine.config import Paths
-from engine.engine import Engine
+from tests.fakes import EngineHarness as _Harness
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-PLUGIN_DIR = os.path.dirname(HERE)
-
-
-class EngineHarness:
-    """Runs a real Engine on a temporary socket for the duration of a test."""
-
-    def __init__(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.paths = Paths(PLUGIN_DIR)
-        base = self.tmp.name
-        self.paths.runtime_dir = base
-        self.paths.state_dir = base
-        self.paths.cache_dir = os.path.join(base, "cache")
-        self.paths.config_dir = os.path.join(base, "config")
-        self.paths.socket_path = os.path.join(base, "d.sock")
-        self.paths.lock_path = os.path.join(base, "d.lock")
-        self.paths.info_path = os.path.join(base, "d.json")
-        self.paths.db_path = os.path.join(base, "t.db")
-        self.paths.log_path = os.path.join(base, "t.log")
-        self.paths.credentials_path = os.path.join(base, "config", "credentials.json")
-        self.paths.ensure()
-        self.engine = Engine(self.paths)
-        self.task = None
-
-    async def __aenter__(self):
-        self.task = asyncio.ensure_future(self.engine.run())
-        for _ in range(200):
-            if os.path.exists(self.paths.socket_path):
-                break
-            await asyncio.sleep(0.01)
-        return self
-
-    async def __aexit__(self, *exc):
-        self.engine.request_stop()
-        await asyncio.wait_for(self.task, 5)
-        self.tmp.cleanup()
-
+class EngineHarness(_Harness):
     async def connect(self):
         reader, writer = await asyncio.open_unix_connection(self.paths.socket_path)
         return Conn(reader, writer)

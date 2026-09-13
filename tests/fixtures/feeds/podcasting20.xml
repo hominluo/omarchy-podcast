@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:podcast="https://podcastindex.org/namespace/1.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel>
+  <title>Example Show</title>
+  <link>https://example.com/show</link>
+  <language>en-us</language>
+  <description>&lt;p&gt;A show about &lt;b&gt;things&lt;/b&gt;.&lt;/p&gt;&lt;script&gt;alert(1)&lt;/script&gt;</description>
+  <itunes:author>Jane Host</itunes:author>
+  <itunes:image href="https://example.com/art.jpg"/>
+  <podcast:guid>917393e3-1b1e-5cef-ace4-edaa54e1f810</podcast:guid>
+  <podcast:funding url="https://example.com/support">Support the show</podcast:funding>
+  <item>
+    <title>Episode 2: Tags</title>
+    <guid isPermaLink="false">ep-2</guid>
+    <pubDate>Wed, 02 Sep 2026 10:00:00 +0000</pubDate>
+    <enclosure url="https://cdn.example.com/ep2.mp3" type="audio/mpeg" length="12345"/>
+    <itunes:duration>01:02:03</itunes:duration>
+    <itunes:episode>2</itunes:episode>
+    <itunes:season>1</itunes:season>
+    <itunes:image href="https://example.com/ep2.jpg"/>
+    <podcast:transcript url="https://example.com/ep2.vtt" type="text/vtt" language="en"/>
+    <podcast:transcript url="https://example.com/ep2.json" type="application/json"/>
+    <podcast:chapters url="https://example.com/ep2.chapters.json" type="application/json+chapters"/>
+    <podcast:person role="host" img="https://example.com/jane.png">Jane Host</podcast:person>
+    <content:encoded><![CDATA[<div>Show notes with <a href="https://example.com/x" onclick="evil()">a link</a><img src="https://t.example/pixel.gif"><iframe src="https://x"></iframe></div>]]></content:encoded>
+  </item>
+  <item>
+    <title>Episode 1: No guid</title>
+    <pubDate>Tue, 01 Sep 2026 10:00:00 GMT</pubDate>
+    <enclosure url="https://cdn.example.com/ep1.mp3" type="audio/mpeg"/>
+    <itunes:duration>1830</itunes:duration>
+    <description>Plain text notes.
+
+Second paragraph.</description>
+  </item>
+  <item>
+    <title>Video only</title>
+    <guid>video-1</guid>
+    <enclosure url="https://cdn.example.com/v.mp4" type="video/mp4"/>
+  </item>
+  <item>
+    <title>No enclosure</title>
+    <guid>none-1</guid>
+  </item>
+</channel>
+</rss>
