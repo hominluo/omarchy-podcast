@@ -368,6 +368,10 @@ class Playback:
             self.loading_id = None
             raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv refused to play: %s" % error)
         LOG.info("playing episode %d (%s) from %.0fs %s", row["id"], row["title"][:60], start, "local" if local else "stream")
+        artwork = getattr(self.engine, "artwork", None)
+        if artwork is not None:
+            asyncio.ensure_future(artwork.ensure_episode(row["id"]))
+            asyncio.ensure_future(artwork.ensure_podcast(row["podcast_id"]))
         self.engine.library.record_action(row["id"], "play", position=start, total=row["duration"], started=start)
         return self.player_state()
 

@@ -152,6 +152,9 @@ class Library:
             self.store.execute(
                 "INSERT INTO subscription_changes (feed_url, action, timestamp) VALUES (?, 'add', ?)", (final_url, stamp))
         LOG.info("subscribed to %s (%d episodes)", podcast["title"], len(parsed["episodes"]))
+        artwork = getattr(self.engine, "artwork", None)
+        if artwork is not None:
+            asyncio.ensure_future(artwork.ensure_podcast(podcast_id))
         self.broadcast_library()
         self.broadcast_inbox()
         self.engine.emit("episodes-changed", {"podcastId": podcast_id, "added": result["added"], "updated": result["updated"]})

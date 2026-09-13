@@ -6,7 +6,7 @@ import qs.Ui
 import "components"
 import "Model.js" as Model
 
-// The now-playing dropdown under the bar icon.
+// The now-playing dropdown under the bar icon (a qs.Ui.Panel).
 //
 // Owned by BarWidget.qml, which injects `bar`, `settings`, `anchorItem`,
 // `hostWidget` and `service`. Everything visible here reads from the service;
@@ -61,7 +61,7 @@ Panel {
   property string focusSection: "seek"
   property int selectedIndex: 0
 
-  readonly property var transportActions: ["back", "playPause", "forward", "speed", "sleep"]
+  readonly property var transportActions: transport.actions
   readonly property var toggleActions: ["skipSilence", "voiceBoost"]
   readonly property var footerActions: ["browse", "refresh"]
 
@@ -131,16 +131,7 @@ Panel {
     }
   }
 
-  function runTransport(action) {
-    if (!service) return
-    switch (action) {
-      case "back": service.seekRelative(-skipBack); break
-      case "playPause": service.togglePause(); break
-      case "forward": service.seekRelative(skipForward); break
-      case "speed": root.cycleSpeed(1); break
-      case "sleep": root.cycleSleep(); break
-    }
-  }
+  function runTransport(action) { transport.run(action) }
 
   function runToggle(action) {
     if (!service) return
@@ -153,25 +144,8 @@ Panel {
     else if (action === "refresh") root.refresh()
   }
 
-  function cycleSpeed(direction) {
-    if (!service || !player) return
-    service.setSpeed(Model.nextSpeed(player.baseSpeed || player.speed, direction))
-  }
-
-  // Off -> default minutes -> 45 -> 60 -> end of episode -> end of chapter -> off.
-  function cycleSleep() {
-    if (!service || !player) return
-    var sleep = player.sleep || { mode: "off" }
-    if (sleep.mode === "off") { service.setSleepTimer("minutes", sleepDefault); return }
-    if (sleep.mode === "minutes") {
-      var left = Math.round(((Number(sleep.endsAt) || 0) * 1000 - Date.now()) / 60000)
-      if (left < 45) { service.setSleepTimer("minutes", 45); return }
-      if (left < 60) { service.setSleepTimer("minutes", 60); return }
-      service.setSleepTimer("episode"); return
-    }
-    if (sleep.mode === "episode") { service.setSleepTimer(chapters.length > 0 ? "chapter" : "off"); return }
-    service.setSleepTimer("off")
-  }
+  function cycleSpeed(direction) { transport.cycleSpeed(direction) }
+  function cycleSleep() { transport.cycleSleep() }
 
   function browse(view) {
     root.close()
@@ -425,61 +399,17 @@ Panel {
           Item {
             visible: root.hasEpisode
             width: parent.width
-            implicitHeight: transportRow.implicitHeight
+            implicitHeight: transport.implicitHeight
 
-            Row {
-              id: transportRow
+            TransportRow {
+              id: transport
               anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(6)
-
-              Repeater {
-                model: root.transportActions
-
-                Button {
-                  id: transportButton
-                  required property string modelData
-                  required property int index
-                  readonly property bool isPlay: modelData === "playPause"
-                  readonly property bool isSpeed: modelData === "speed"
-                  readonly property bool isSleep: modelData === "sleep"
-
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  hasCursor: root.cursorActive && root.focusSection === "transport" && root.selectedIndex === index
-                  selected: (isSleep && root.sleeping) || (isSpeed && root.player && Math.abs((root.player.baseSpeed || 1) - 1) > 0.001)
-                  bordered: true
-                  iconSize: isPlay ? Style.font.iconLarge : Style.font.icon
-                  fontSize: Style.font.caption
-                  horizontalPadding: isPlay ? Style.space(14) : Style.spacing.controlPaddingX
-                  iconText: {
-                    if (modelData === "back") return root.skipBack === 15 ? "󱥆" : (root.skipBack === 30 ? "󰶖" : "󰑟")
-                    if (modelData === "forward") return root.skipForward === 30 ? "󰴆" : (root.skipForward === 15 ? "󱤺" : "󰈑")
-                    if (isPlay) return root.playing ? "󰏤" : "󰐊"
-                    if (isSpeed) return ""
-                    return "󰒲"
-                  }
-                  text: {
-                    if (modelData === "back") return root.skipBack === 15 || root.skipBack === 30 ? "" : String(root.skipBack)
-                    if (modelData === "forward") return root.skipForward === 30 || root.skipForward === 15 ? "" : String(root.skipForward)
-                    if (isSpeed) return root.player ? Model.formatSpeed(root.player.baseSpeed || root.player.speed) : "1×"
-                    if (isSleep && root.sleeping) return Model.sleepLabel(root.player.sleep)
-                    return ""
-                  }
-                  tooltipText: {
-                    if (modelData === "back") return "Back " + root.skipBack + " s  (h, ←)"
-                    if (modelData === "forward") return "Forward " + root.skipForward + " s  (l, →)"
-                    if (isPlay) return (root.playing ? "Pause" : "Play") + "  (Space)"
-                    if (isSpeed) return "Playback speed  (s / S)"
-                    return root.sleeping ? "Sleep timer: " + Model.sleepLabel(root.player.sleep) + "  (z)" : "Sleep timer  (z)"
-                  }
-                  onHovered: function(isHovered) { if (isHovered) root.setCursor("transport", index) }
-                  onClicked: root.runTransport(modelData)
-                  onRightClicked: {
-                    if (isSpeed) root.cycleSpeed(-1)
-                    else if (isSleep && root.service) root.service.setSleepTimer("off")
-                  }
-                }
-              }
+              service: root.service
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: root.cursorActive && root.focusSection === "transport"
+              cursorIndex: root.selectedIndex
+              onHovered: function(index) { root.setCursor("transport", index) }
             }
           }
 

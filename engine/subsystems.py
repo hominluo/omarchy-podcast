@@ -9,16 +9,27 @@ Start order matters: playback installs its callbacks on the mpv client
 before the client connects, and both need the library and queue.
 """
 
+from . import opml  # noqa: F401  (registers its commands)
+from .artwork import ArtworkCache
 from .library import Library
 from .playback import Playback
 from .player import MpvClient
 from .queue import Queue
+from .scheduler import Scheduler
+from .search import Search
 
 
 def attach(engine):
     engine.library = Library(engine)
     engine.queue = Queue(engine)
+    engine.artwork = ArtworkCache(engine)
+    engine.search = Search(engine)
     engine.mpv = MpvClient(engine)
     engine.playback = Playback(engine)
-    engine.subsystems = [engine.library, engine.queue, engine.playback, engine.mpv]
+    engine.scheduler = Scheduler(engine)
+    engine.housekeeping_hooks = []
+    engine.subsystems = [
+        engine.library, engine.queue, engine.artwork, engine.search,
+        engine.playback, engine.mpv, engine.scheduler,
+    ]
     return engine

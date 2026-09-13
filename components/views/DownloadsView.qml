@@ -4,34 +4,33 @@ import qs.Ui
 import ".."
 import "../../Model.js" as Model
 
-// Episodes kept on disk. (placeholder until the view lands)
+// Episodes on disk, and the ones on their way there.
 Item {
   id: root
   required property var browser
   readonly property var service: browser ? browser.service : null
+  readonly property var items: service ? (service.downloads || []) : []
 
-  // The browser asks the view first; return true when the key was used.
-  function handleKey(event) { return false }
-  // Esc ladder hook: return true when something view-local was closed.
+  function handleKey(event) { return body.handleKey(event) }
   function handleEscape() { return false }
 
-  ViewHeader {
-    id: header
-    width: parent.width
+  ListWithDetail {
+    id: body
+    anchors.fill: parent
+    browser: root.browser
     title: "Downloads"
-    subtitle: "Episodes kept on disk."
-    foreground: browser.foreground
-    fontFamily: browser.fontFamily
-  }
-
-  Text {
-    anchors.top: header.bottom
-    anchors.topMargin: Style.space(24)
-    textFormat: Text.PlainText
-    text: "Nothing here yet."
-    color: browser.dim
-    font.family: browser.fontFamily
-    font.pixelSize: Style.font.body
-    renderType: Text.NativeRendering
+    subtitle: root.items.length === 0 ? "Downloaded episodes play offline and can be transcribed locally."
+             : root.items.length + (root.items.length === 1 ? " episode" : " episodes")
+    items: root.items
+    emptyText: "No downloads yet. Press d on an episode to keep it on disk."
+    extraKeys: function(event) {
+      if (event.text === "x" && body.current && service) {
+        if (body.current.download === "done") service.deleteDownload(body.current.id)
+        else service.cancelDownload(body.current.id)
+        return true
+      }
+      return false
+    }
+    onActivated: function(episode) { body.openDetail(episode) }
   }
 }

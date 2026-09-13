@@ -15,6 +15,22 @@ else
   echo "node not found; skipping Model.js tests"
 fi
 
+# qmllint needs the shell's `qs.*` modules; a scratch import root maps the
+# prefix onto the installed shell. Runtime-only types (PanelWindow) and the
+# facade-injected properties are expected noise and are switched off.
+QMLLINT=/usr/lib/qt6/bin/qmllint
+if [[ -x $QMLLINT && -d /usr/share/omarchy/shell ]]; then
+  lintroot=$(mktemp -d)
+  ln -s /usr/share/omarchy/shell "$lintroot/qs"
+  "$QMLLINT" -I "$lintroot" -I /usr/lib/qt6/qml \
+    --unqualified disable --unused-imports disable --prefer-non-var-properties disable \
+    --signal-handler-parameters disable --missing-property disable --stale-property-read disable \
+    --access-singleton-via-object disable --import disable --uncreatable-type disable \
+    Service.qml BarWidget.qml PlayerPanel.qml Browser.qml components/*.qml components/views/*.qml \
+    2>&1 | grep -E "^(Warning|Error)" | grep -v "incomplete composite" || true
+  rm -rf "$lintroot"
+fi
+
 if command -v omarchy-plugin-validate >/dev/null 2>&1; then
   omarchy plugin validate .
 fi

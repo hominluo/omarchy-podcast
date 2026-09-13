@@ -18,7 +18,7 @@ Item {
   property real duration: 0
   property var chapters: []
   property int step: 15
-  property bool enabled: duration > 0
+  readonly property bool seekable: duration > 0
   property color foreground: bar ? bar.foreground : Color.foreground
   property color background: bar ? bar.background : Color.popups.background
   property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -40,13 +40,13 @@ Item {
     maximum: Math.max(1, root.duration)
     step: root.step
     value: root.position
-    enabled: root.enabled
-    opacity: root.enabled ? 1 : 0.45
+    enabled: root.seekable
+    opacity: root.seekable ? 1 : 0.45
     fillColor: root.foreground
     knobColor: root.foreground
     trackColor: Style.selectedFillFor(root.foreground, Color.accent)
     tickColor: root.background
-    onReleased: function(value) { if (root.enabled) root.seekRequested(value) }
+    onReleased: function(value) { if (root.seekable) root.seekRequested(value) }
   }
 
   Repeater {
