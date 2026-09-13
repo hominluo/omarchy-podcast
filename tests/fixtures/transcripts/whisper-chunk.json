@@ -1,0 +1,6 @@
+{"result": {"language": "en"}, "transcription": [
+  {"timestamps": {"from": "00:00:00,000", "to": "00:00:03,500"}, "offsets": {"from": 0, "to": 3500}, "text": " Hello there."},
+  {"timestamps": {"from": "00:00:03,500", "to": "00:00:06,000"}, "offsets": {"from": 3500, "to": 6000}, "text": " [MUSIC]"},
+  {"timestamps": {"from": "00:00:06,000", "to": "00:00:09,000"}, "offsets": {"from": 6000, "to": 9000}, "text": " Thanks thanks thanks thanks thanks thanks."},
+  {"timestamps": {"from": "00:00:09,000", "to": "00:00:12,000"}, "offsets": {"from": 9000, "to": 12000}, "text": " Sure."}
+]}

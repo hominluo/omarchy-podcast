@@ -1,0 +1,5 @@
+{"version": "1.0.0", "segments": [
+  {"speaker": "Alice", "startTime": 0.5, "endTime": 4, "body": "Hello there."},
+  {"startTime": 4.0, "endTime": 8.25, "body": "Thanks for having me."},
+  {"start": 900000, "end": 912000, "text": "Milliseconds here."}
+]}

@@ -19,6 +19,7 @@ from .player import MpvClient
 from .queue import Queue
 from .scheduler import Scheduler
 from .search import Search
+from .transcripts.manager import Transcripts
 
 
 def attach(engine):
@@ -27,6 +28,7 @@ def attach(engine):
     engine.artwork = ArtworkCache(engine)
     engine.chapters = Chapters(engine)
     engine.downloads = Downloads(engine)
+    engine.transcripts = Transcripts(engine)
     engine.search = Search(engine)
     engine.mpv = MpvClient(engine)
     engine.playback = Playback(engine)
@@ -34,6 +36,6 @@ def attach(engine):
     engine.housekeeping_hooks = []
     engine.subsystems = [
         engine.library, engine.queue, engine.artwork, engine.chapters, engine.search,
-        engine.downloads, engine.playback, engine.mpv, engine.scheduler,
+        engine.downloads, engine.transcripts, engine.playback, engine.mpv, engine.scheduler,
     ]
     return engine

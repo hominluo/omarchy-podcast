@@ -20,6 +20,10 @@ Item {
   readonly property var chapters: service ? service.chapters : []
   readonly property bool hasEpisode: service ? service.hasEpisode : false
   readonly property int chapterIndex: Model.chapterIndexAt(chapters, clock.position)
+  // The transcript pane can show another episode (opened from its detail
+  // page) while the player keeps playing what it was playing.
+  readonly property int transcriptEpisodeId: browser && browser.viewArgs && browser.viewArgs.episodeId
+    ? Number(browser.viewArgs.episodeId) || 0 : (episode ? Number(episode.id) || 0 : 0)
 
   property string tab: "transcript"     // transcript | chapters | notes
   property var detail: null
@@ -93,9 +97,11 @@ Item {
     running: browser.opened && browser.view === "nowPlaying"
   }
 
+  readonly property bool showPlayer: root.hasEpisode || root.transcriptEpisodeId > 0
+
   Text {
     anchors.centerIn: parent
-    visible: !root.hasEpisode
+    visible: !root.showPlayer
     textFormat: Text.PlainText
     text: "Nothing playing. Pick an episode from the library or the inbox."
     color: browser.dim
@@ -106,7 +112,7 @@ Item {
 
   Row {
     anchors.fill: parent
-    visible: root.hasEpisode
+    visible: root.showPlayer
     spacing: Style.space(24)
 
     // ---------- Left: the player ----------
@@ -269,15 +275,10 @@ Item {
           id: transcript
           anchors.fill: parent
           active: root.tab === "transcript"
-          source: Qt.resolvedUrl("../TranscriptView.qml")
-          onLoaded: { item.browser = root.browser; item.episode = root.episode }
-        }
-
-        Binding {
-          target: transcript.item
-          property: "episode"
-          value: root.episode
-          when: transcript.status === Loader.Ready
+          sourceComponent: TranscriptView {
+            browser: root.browser
+            episodeId: root.transcriptEpisodeId
+          }
         }
 
         ListView {

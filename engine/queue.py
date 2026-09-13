@@ -71,6 +71,12 @@ class Queue:
         self.broadcast()
         for episode_id in added:
             self.engine.library.emit_episode(episode_id)
+        hook = getattr(self.engine, "on_queued", None)
+        if hook and added:
+            try:
+                hook(list(added))
+            except Exception:  # noqa: BLE001
+                LOG.exception("queue hook failed")
         return {"added": added}
 
     def remove(self, episode_ids):

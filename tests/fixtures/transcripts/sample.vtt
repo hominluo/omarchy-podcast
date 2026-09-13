@@ -1,0 +1,12 @@
+WEBVTT
+
+NOTE this is a note
+
+00:00.500 --> 00:04.000
+<v Alice>Hello there, <b>welcome</b> to the show.
+
+00:04.000 --> 00:08.250
+<v Bob>Thanks for having me.
+
+00:00:09.000 --> 00:00:12.000
+No speaker here.
