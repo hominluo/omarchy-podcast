@@ -287,6 +287,10 @@ class Playback:
         if row is None:
             return
         self.engine.library.set_position(self.current_id, self.pos, flush_action=action)
+        if action:
+            settled = getattr(self.engine, "on_playback_settled", None)
+            if settled:
+                settled()
         duration = self.duration or float(row["duration"] or 0)
         if duration > 0 and not row["played"] and self.pos / duration >= PLAYED_THRESHOLD:
             self.store.execute("UPDATE episodes SET played = 1, played_at = ?, state = 'archived' WHERE id = ?", (now(), self.current_id))

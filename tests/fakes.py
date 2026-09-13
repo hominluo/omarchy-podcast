@@ -2,9 +2,11 @@
 
 import asyncio
 import http.server
+import json
 import os
 import tempfile
 import threading
+import urllib.parse
 
 from engine.config import Paths
 from engine.engine import Engine
@@ -22,6 +24,7 @@ class FakeHttpServer:
 
     def __init__(self):
         self.routes = {}
+        self.json_routes = {}      # path -> fn(method, params, body) -> dict
         self.requests = []
         self.fail_after_bytes = None
         server = self
@@ -32,7 +35,38 @@ class FakeHttpServer:
             def log_message(self, *args):
                 pass
 
+            def _json(self, method):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                path, _, query = self.path.partition("?")
+                params = dict(urllib.parse.parse_qsl(query))
+                body = json.loads(raw) if raw else None
+                server.requests.append((method, self.path, dict(self.headers), body))
+                handler = server.json_routes.get(path)
+                if handler is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                try:
+                    result = handler(method, params, body)
+                    status = 200
+                except PermissionError:
+                    result, status = {"error": "auth"}, 401
+                payload = json.dumps(result).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                self._json("POST")
+
             def _serve(self, send_body):
+                if self.path.split("?")[0] in server.json_routes:
+                    self._json(self.command)
+                    return
                 server.requests.append((self.command, self.path, dict(self.headers)))
                 route = server.routes.get(self.path.split("?")[0])
                 if route is None:

@@ -160,6 +160,7 @@ class Library:
         self.engine.emit("episodes-changed", {"podcastId": podcast_id, "added": result["added"], "updated": result["updated"]})
         self.engine.emit("subscribed", {"podcastId": podcast_id})
         self._after_fetch_hooks(podcast_id, result, first_fetch=True)
+        self._settled()
         return models.podcast_summary(self.require_podcast(podcast_id))
 
     def unsubscribe(self, podcast_id, delete_downloads=False):
@@ -182,6 +183,7 @@ class Library:
         self.broadcast_library()
         self.broadcast_inbox()
         self.engine.emit("unsubscribed", {"podcastId": int(podcast_id)})
+        self._settled()
         return {"podcastId": int(podcast_id), "deletedFiles": len(paths)}
 
     def update_podcast(self, podcast_id, **fields):
@@ -341,6 +343,11 @@ class Library:
                     values + (existing[0],))
                 updated += 1
         return {"added": added, "updated": updated}
+
+    def _settled(self):
+        hook = getattr(self.engine, "on_playback_settled", None)
+        if hook:
+            hook()
 
     def _after_fetch_hooks(self, podcast_id, result, first_fetch):
         if result.get("added") and self.on_new_episodes:
