@@ -87,12 +87,11 @@ Item {
     try { payload = JSON.parse(String(payloadJson || "{}")) || {} } catch (e) { payload = {} }
     var target = payload.view ? String(payload.view) : ""
     if (target === "transcript") target = "nowPlaying"
-    if (target !== "" && target !== view) root.navigate(target, payload, root.opened)
-    else if (!root.opened && target === "") { root.history = []; root.viewArgs = payload }
-    if (target === "" && !hasEpisode && view === "nowPlaying") root.view = "library"
-    root.opened = true
     root.helpOpen = false
     root.editing = false
+    root.opened = true
+    if (target !== "" && (target !== view || payload.episodeId || payload.podcastId)) root.navigate(target, payload, root.history.length > 0)
+    else if (target === "") { root.history = []; root.viewArgs = payload; if (!hasEpisode && view === "nowPlaying") root.view = "library" }
     root.refocus()
   }
 
@@ -121,6 +120,7 @@ Item {
       stack.push({ view: root.view, args: root.viewArgs })
       root.history = stack.slice(-20)
     }
+    root.editing = false
     root.view = String(next)
     root.viewArgs = args || {}
     root.detailOpen = false
@@ -146,8 +146,10 @@ Item {
     if (item) root.navigate(item.view, {}, true)
   }
 
+  // Views that want a text field focused set `editing` first; the catcher
+  // only takes the keyboard back when nobody is typing.
   function refocus() {
-    Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
+    Qt.callLater(function() { if (root.opened && !root.editing) keyCatcher.forceActiveFocus() })
   }
 
   function handleEscape() {
