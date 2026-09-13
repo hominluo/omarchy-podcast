@@ -1,0 +1,295 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hominluo.podcast",
+  "name": "Podcast",
+  "version": "0.1.0",
+  "author": "Homin Luo",
+  "license": "MIT",
+  "homepage": "https://github.com/hominluo/Omarchy-Podcast",
+  "description": "A native podcast player for Omarchy: subscriptions, an Up Next queue, an inbox for new episodes, downloads, chapters, transcripts that follow the audio, and sync with gpodder.net or Nextcloud.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Browser.qml"
+  },
+  "barWidget": {
+    "displayName": "Podcast",
+    "description": "Now-playing dropdown with seek, chapters, speed, sleep timer and Up Next. Right-click the icon or press b to open the library.",
+    "category": "Media",
+    "aliases": [
+      "podcast",
+      "podcasts",
+      "pods"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": true,
+      "maxLabelWidth": 160,
+      "barProgress": false,
+      "wheelAction": "seek",
+      "skipBack": 15,
+      "skipForward": 30,
+      "defaultSpeed": 1.0,
+      "continuousPlayback": true,
+      "sleepTimerDefault": 30,
+      "searchProvider": "itunes",
+      "searchCountry": "auto",
+      "downloadDir": "~/Music/Podcasts",
+      "autoDownload": "latest",
+      "keepDownloads": 5,
+      "deletePlayedAfterDays": 7,
+      "initialInboxCount": 1,
+      "notifyNewEpisodes": false,
+      "refreshIntervalMin": 30,
+      "transcriptionPolicy": "on-demand",
+      "whisperDevice": "auto",
+      "whisperModel": "auto",
+      "syncProvider": "none",
+      "syncServer": "https://gpodder.net",
+      "syncUsername": "",
+      "syncDeviceId": "",
+      "syncIntervalMin": 10
+    },
+    "schema": [
+      {
+        "key": "showTitle",
+        "type": "boolean",
+        "label": "Show the episode title in the bar while playing",
+        "defaultValue": true
+      },
+      {
+        "key": "maxLabelWidth",
+        "type": "integer",
+        "label": "Bar title width",
+        "min": 0,
+        "max": 400,
+        "step": 10,
+        "defaultValue": 160,
+        "description": "In the shell's spacing units. Longer titles scroll; 0 hides the title and leaves the icon."
+      },
+      {
+        "key": "barProgress",
+        "type": "boolean",
+        "label": "Progress line under the bar icon",
+        "defaultValue": false,
+        "description": "A two-pixel line that grows with the episode. Off by default because the bar is calmer without it."
+      },
+      {
+        "key": "wheelAction",
+        "type": "enum",
+        "label": "Scroll wheel on the bar icon",
+        "options": [
+          "seek",
+          "none"
+        ],
+        "defaultValue": "seek"
+      },
+      {
+        "key": "skipBack",
+        "type": "integer",
+        "label": "Skip back (seconds)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "skipForward",
+        "type": "integer",
+        "label": "Skip forward (seconds)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "defaultSpeed",
+        "type": "number",
+        "label": "Default playback speed",
+        "min": 0.5,
+        "max": 3,
+        "step": 0.05,
+        "defaultValue": 1.0,
+        "description": "Podcasts can override this from their own page."
+      },
+      {
+        "key": "continuousPlayback",
+        "type": "boolean",
+        "label": "Play the next episode in Up Next when one ends",
+        "defaultValue": true
+      },
+      {
+        "key": "sleepTimerDefault",
+        "type": "integer",
+        "label": "Sleep timer default (minutes)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "searchProvider",
+        "type": "enum",
+        "label": "Search provider",
+        "options": [
+          "itunes",
+          "podcastindex"
+        ],
+        "defaultValue": "itunes",
+        "description": "Apple's catalogue needs no key. Podcast Index needs a free API key, entered in the Settings view, and adds trending shows, search by person, and results that are not tied to one country."
+      },
+      {
+        "key": "searchCountry",
+        "type": "string",
+        "label": "Search region",
+        "defaultValue": "auto",
+        "description": "Two-letter country code for Apple's catalogue, or auto to follow the system locale."
+      },
+      {
+        "key": "downloadDir",
+        "type": "path",
+        "label": "Download folder",
+        "defaultValue": "~/Music/Podcasts"
+      },
+      {
+        "key": "autoDownload",
+        "type": "enum",
+        "label": "Auto-download new episodes",
+        "options": [
+          "none",
+          "latest",
+          "all"
+        ],
+        "defaultValue": "latest",
+        "description": "latest keeps the newest unplayed episode of every podcast on disk; all downloads everything new. Podcasts can override this."
+      },
+      {
+        "key": "keepDownloads",
+        "type": "integer",
+        "label": "Downloads kept per podcast",
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "deletePlayedAfterDays",
+        "type": "integer",
+        "label": "Delete played downloads after (days)",
+        "min": 0,
+        "max": 365,
+        "step": 1,
+        "defaultValue": 7,
+        "description": "0 keeps them forever."
+      },
+      {
+        "key": "initialInboxCount",
+        "type": "integer",
+        "label": "Episodes put in the inbox when you subscribe",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 1
+      },
+      {
+        "key": "notifyNewEpisodes",
+        "type": "boolean",
+        "label": "Desktop notification for new episodes",
+        "defaultValue": false
+      },
+      {
+        "key": "refreshIntervalMin",
+        "type": "integer",
+        "label": "Feed refresh interval (minutes)",
+        "min": 5,
+        "max": 1440,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "transcriptionPolicy",
+        "type": "enum",
+        "label": "Local transcription",
+        "options": [
+          "off",
+          "on-demand",
+          "downloaded",
+          "queued"
+        ],
+        "defaultValue": "on-demand",
+        "description": "Runs whisper.cpp on this machine for episodes that ship no transcript. on-demand transcribes when you open the transcript; downloaded and queued also transcribe episodes as they are downloaded or added to Up Next."
+      },
+      {
+        "key": "whisperDevice",
+        "type": "enum",
+        "label": "Transcription device",
+        "options": [
+          "auto",
+          "gpu",
+          "cpu"
+        ],
+        "defaultValue": "auto"
+      },
+      {
+        "key": "whisperModel",
+        "type": "enum",
+        "label": "Transcription model",
+        "options": [
+          "auto",
+          "large-v3-turbo",
+          "small",
+          "base"
+        ],
+        "defaultValue": "auto",
+        "description": "auto picks large-v3-turbo on a GPU with room for it and small or base on the CPU. Models download on first use."
+      },
+      {
+        "key": "syncProvider",
+        "type": "enum",
+        "label": "Sync",
+        "options": [
+          "none",
+          "gpodder",
+          "nextcloud"
+        ],
+        "defaultValue": "none",
+        "description": "Keep subscriptions and playback positions in step with other apps through gpodder.net or the Nextcloud GPodder Sync app. The password is entered in the Settings view, not here."
+      },
+      {
+        "key": "syncServer",
+        "type": "string",
+        "label": "Sync server",
+        "defaultValue": "https://gpodder.net"
+      },
+      {
+        "key": "syncUsername",
+        "type": "string",
+        "label": "Sync username",
+        "defaultValue": ""
+      },
+      {
+        "key": "syncDeviceId",
+        "type": "string",
+        "label": "Sync device id",
+        "defaultValue": "",
+        "description": "Blank uses omarchy-<hostname>."
+      },
+      {
+        "key": "syncIntervalMin",
+        "type": "integer",
+        "label": "Sync interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run every check this repository knows how to run.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# Bytecode stays out of the plugin folder; the shell reloads on every write here.
+export PYTHONPYCACHEPREFIX="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/podcast/pycache"
+
+python3 -m compileall -q engine podcastd.py
+python3 -m unittest discover -s tests -t . "${@:---quiet}"
+
+if command -v node >/dev/null 2>&1; then
+  node --test tests/
+else
+  echo "node not found; skipping Model.js tests"
+fi
+
+if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  omarchy plugin validate .
+fi
+
+echo "All checks passed."
