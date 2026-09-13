@@ -257,6 +257,12 @@ class Library:
             values.append(int(podcast_id))
             self.store.execute("UPDATE podcasts SET %s WHERE id = ?" % ", ".join(sets), values)
             self.broadcast_library()
+            playback = getattr(self.engine, "playback", None)
+            if playback is not None and playback.current_row is not None and playback.current_row["podcast_id"] == int(podcast_id):
+                # nowPlaying carries the podcast's speed override.
+                playback.broadcast_now_playing()
+                if "speed" in fields and playback.loaded:
+                    asyncio.ensure_future(playback._apply_speed())
         return models.podcast_detail(self.require_podcast(podcast_id))
 
     # ---- refresh -----------------------------------------------------------

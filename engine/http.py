@@ -175,6 +175,8 @@ def _read_capped(response, cap):
     out = io.BytesIO()
     total = 0
     inflater = None
+    gzipped = False      # gzip bodies are a series of members (RFC 1952)
+    between = False      # finished one member, expecting the next header
     sniffed = False
     head = b""
     while True:
@@ -193,17 +195,34 @@ def _read_capped(response, cap):
             # Servers lie about gzip in both directions: sniff the magic bytes.
             if chunk[:2] == b"\x1f\x8b":
                 inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                gzipped = True
             elif encoding == "deflate":
                 inflater = zlib.decompressobj(zlib.MAX_WBITS if chunk[:1] == b"\x78" else -zlib.MAX_WBITS)
         if inflater is None:
             piece = chunk
         else:
-            try:
-                piece = inflater.decompress(chunk, cap - total + 1)
-            except zlib.error as error:
-                raise FetchError("http", "could not decompress the response: %s" % _short(error))
-            if inflater.unconsumed_tail:
-                raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
+            piece = b""
+            data = chunk
+            while True:
+                if between:
+                    # Between members: skip NUL padding, then expect a header.
+                    data = data.lstrip(b"\x00")
+                    if not data:
+                        break
+                    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    between = False
+                try:
+                    piece += inflater.decompress(data, cap - total - len(piece) + 1)
+                except zlib.error as error:
+                    raise FetchError("http", "could not decompress the response: %s" % _short(error))
+                if inflater.unconsumed_tail:
+                    raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
+                if not (gzipped and inflater.eof):
+                    break
+                # One decompressobj stops after the first member and parks the
+                # rest in unused_data; carry it into the next member.
+                data = inflater.unused_data
+                between = True
         total += len(piece)
         if total > cap:
             raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))
@@ -217,6 +236,8 @@ def _read_capped(response, cap):
             tail = inflater.flush()
         except zlib.error as error:
             raise FetchError("http", "could not decompress the response: %s" % _short(error))
+        if not inflater.eof and not between:
+            raise FetchError("http", "the compressed response ended before its end-of-stream marker")
         total += len(tail)
         if total > cap:
             raise FetchError("too-large", "the response is larger than %d MB" % (cap // (1024 * 1024)))

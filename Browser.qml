@@ -105,8 +105,15 @@ Item {
     root.refocus()
   }
 
-  // A view that stops editing hands the keyboard back to the catcher.
-  onEditingChanged: if (!editing && opened) refocus()
+  // A view that stops editing hands the keyboard back to the catcher, unless
+  // Tab already moved the focus to another control in the form.
+  onEditingChanged: {
+    if (editing || !opened) return
+    Qt.callLater(function() {
+      var current = keyCatcher.Window.activeFocusItem
+      if (root.opened && !root.editing && !(current && current !== keyCatcher && current.activeFocusOnTab)) keyCatcher.forceActiveFocus()
+    })
+  }
 
   function close() {
     root.opened = false

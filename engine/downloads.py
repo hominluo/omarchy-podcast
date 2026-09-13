@@ -131,7 +131,9 @@ class Downloads:
         current = self.jobs.get(episode_id)
         if current is not None:
             # Either waiting in line, or a cancelled transfer whose thread may
-            # still hold the .part file: the worker re-enqueues when it drains.
+            # still hold the .part file: the worker re-enqueues when it drains,
+            # at the most urgent priority asked for meanwhile.
+            current.priority = min(current.priority, priority)
             return current
         self._seq += 1
         job = Job(int(episode_id), int(keep), priority, self._seq)
@@ -281,7 +283,9 @@ class Downloads:
                                    (plan.get("etag"), plan.get("last_modified"), episode_id))
                 self._cover_for(plan)
             except Cancelled:
-                self.store.execute("UPDATE downloads SET status = 'paused', bytes_done = ? WHERE episode_id = ? AND status = 'downloading'",
+                # cancel() already flipped the row to 'paused'; a re-requested
+                # ('queued') or deleted row stays untouched.
+                self.store.execute("UPDATE downloads SET status = 'paused', bytes_done = ? WHERE episode_id = ? AND status IN ('downloading', 'paused')",
                                    (job.bytes_done, episode_id))
             except http.FetchError as error:
                 settled = await self._failed(job, error.message)

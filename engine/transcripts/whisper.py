@@ -156,7 +156,7 @@ def download_model(models_dir, model, progress=None, cancel=None):
             while True:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled()
-                chunk = response.read(256 * 1024)
+                chunk = http.read_chunk(response)
                 if not chunk:
                     break
                 handle.write(chunk)

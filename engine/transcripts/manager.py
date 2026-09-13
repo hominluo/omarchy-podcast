@@ -31,8 +31,8 @@ class Transcripts:
         self.current = None         # episode id being transcribed
         self._cancel = None
         self._task = None
-        self._model_task = None       # one model download at a time, shared
-        self._model_cancel = None
+        self._model_tasks = {}        # model -> (task, stop event); one download per model, shared
+        self._forgotten = None        # running job whose transcript was deleted meanwhile
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -42,7 +42,7 @@ class Transcripts:
         self.engine.on_settings_changed(self._detect)
         self.engine.on_download_done = self._on_download_done
         self.engine.on_queued = self._on_queued
-        # A run interrupted by a restart picks up where it stopped.
+        # A run interrupted by a restart is queued again and redone from the start.
         self.store.execute("UPDATE transcripts SET status = 'queued' WHERE status = 'partial' AND source = 'whisper'")
         self.store.execute("DELETE FROM transcripts WHERE episode_id NOT IN (SELECT id FROM episodes)")
         for row in self.store.all("SELECT t.episode_id FROM transcripts t JOIN episodes e ON e.id = t.episode_id "
@@ -54,8 +54,8 @@ class Transcripts:
     async def stop(self, restart=False, quit_mpv=True):
         if self._cancel is not None:
             self._cancel.set()
-        if self._model_cancel is not None:
-            self._model_cancel.set()
+        for _task, stop in self._model_tasks.values():
+            stop.set()
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -233,6 +233,7 @@ class Transcripts:
             self.pending.remove(episode_id)
         if self.current == episode_id and self._cancel is not None:
             self._cancel.set()
+            self._forgotten = episode_id
         trow = self._row(episode_id)
         if trow is not None and trow["path"]:
             try:
@@ -255,24 +256,28 @@ class Transcripts:
                 await self._transcribe(episode_id)
             except whisper.Cancelled:
                 LOG.info("transcription of episode %d cancelled", episode_id)
-                self._upsert(episode_id, status="error", error="cancelled")
+                if self._forgotten != episode_id:
+                    self._upsert(episode_id, status="error", error="cancelled")
                 self._progress(episode_id, "error", 0, [], error="cancelled")
             except (whisper.TranscribeError, protocol.ProtocolError) as error:
                 message = getattr(error, "message", None) or str(error)
                 LOG.warning("transcription of episode %d failed: %s", episode_id, message)
-                self._upsert(episode_id, status="error", error=message[:200])
+                if self._forgotten != episode_id:
+                    self._upsert(episode_id, status="error", error=message[:200])
                 self._progress(episode_id, "error", 0, [], error=message)
                 self.engine.notice("error", "Transcription failed: %s" % message, episode_id=episode_id)
             except Exception as error:  # noqa: BLE001
                 LOG.exception("transcription of episode %d crashed", episode_id)
                 try:
-                    self._upsert(episode_id, status="error", error=str(error)[:200])
+                    if self._forgotten != episode_id:
+                        self._upsert(episode_id, status="error", error=str(error)[:200])
                 except (sqlite3.Error, AttributeError):
                     LOG.exception("could not record the failure")
                 self._progress(episode_id, "error", 0, [], error=str(error))
             finally:
                 self.current = None
                 self._cancel = None
+                self._forgotten = None
                 self.engine.library.emit_episode(episode_id)
                 self._broadcast_jobs()
 
@@ -288,19 +293,19 @@ class Transcripts:
         path = whisper.model_path(self.engine.paths.models_dir, model)
         if whisper.model_ok(path, model):
             return path
-        if self._model_task is None or self._model_task.done():
-            self._model_cancel = threading.Event()
-            self._model_task = asyncio.ensure_future(self._download_model(model))
-        task = self._model_task
+        entry = self._model_tasks.get(model)
+        if entry is None or entry[0].done():
+            stop = threading.Event()
+            entry = (asyncio.ensure_future(self._download_model(model, stop)), stop)
+            self._model_tasks[model] = entry
+        task = entry[0]
         while not task.done():
             done, _ = await asyncio.wait([task], timeout=0.5)
             if not done and cancel is not None and cancel.is_set():
                 raise whisper.Cancelled()
         return task.result()
 
-    async def _download_model(self, model):
-        cancel = self._model_cancel
-
+    async def _download_model(self, model, cancel):
         def progress(done, total):
             self.engine.call_soon(lambda d=done, t=total: self.engine.update_state(
                 "jobs", modelDownload={"model": model, "percent": int(100 * d / max(1, t)), "done": d, "total": t}))
@@ -311,7 +316,8 @@ class Transcripts:
         except http.FetchError as error:
             raise whisper.TranscribeError("could not download the model: %s" % error.message)
         finally:
-            self.engine.update_state("jobs", modelDownload=None)
+            if not any(not task.done() for name, (task, _stop) in self._model_tasks.items() if name != model):
+                self.engine.update_state("jobs", modelDownload=None)
         self._detect()
         return path
 
@@ -333,6 +339,8 @@ class Transcripts:
                 raise whisper.Cancelled()
         path = waiter.result()
         if not path:
+            if self._cancel.is_set():
+                raise whisper.Cancelled()
             raise whisper.TranscribeError("could not fetch the audio")
         return path
 
@@ -373,6 +381,8 @@ class Transcripts:
                             whisper.transcribe_chunk, self.info["binary"], model_path, wav, offset, length, language, gpu, threads, self._cancel)
                     else:
                         raise
+                if self._cancel.is_set():
+                    raise whisper.Cancelled()
                 if language == "auto" and detected:
                     language = detected
                     doc["language"] = detected

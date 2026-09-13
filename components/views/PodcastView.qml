@@ -80,7 +80,7 @@ Item {
   }
 
   function endSearch(clear) {
-    if (clear) { query = ""; searchField.text = "" }
+    if (clear) { list.resetScroll(); query = ""; searchField.text = "" }
     searching = query !== ""
     browser.editing = false
     browser.refocus()
