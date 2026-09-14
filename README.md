@@ -3,6 +3,8 @@
 <p align="center">
   A native podcast player for the <a href="https://omarchy.org">Omarchy</a> shell —
   a bar widget, a now-playing dropdown, and a launcher-style window that opens on the charts.
+<br>
+  <sub>by <a href="https://x.com/hominluo">@hominluo</a></sub>
 </p>
 
 <p align="center">
@@ -347,4 +349,11 @@ window; `Service.qml` is kept loaded across reloads, so changes to it need
 
 MIT — see [LICENSE](LICENSE). Third-party notices are in [NOTICE.md](NOTICE.md).
 
-<p align="center">Built by <a href="https://x.com/hominluo">@hominluo</a></p>
+---
+
+<p align="center">
+  Built by <a href="https://x.com/hominluo">@hominluo</a> ·
+  <a href="https://github.com/hominluo">GitHub</a> ·
+  <a href="https://github.com/hominluo/Omarchy-Podcast/issues">Issues</a> ·
+  <a href="https://github.com/hominluo/Omarchy-Podcast/releases">Releases</a>
+</p>
