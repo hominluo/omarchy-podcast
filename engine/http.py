@@ -22,9 +22,13 @@ from . import VERSION, log
 
 LOG = log.get("http")
 
-USER_AGENT = "Omarchy-Podcast/%s (+https://github.com/hominluo/Omarchy-Podcast)" % VERSION
+# No URL in the agent string: some feed hosts (xiaoyuzhou's feed.xyzfm.space
+# among them) answer 403 to any agent that carries one.
+USER_AGENT = "Omarchy-Podcast/%s (Linux)" % VERSION
 DEFAULT_TIMEOUT = 30
-MAX_REDIRECTS = 5
+# Tracking chains on enclosures (podtrac -> pdst -> vpixl -> pscrb -> host)
+# run to six or seven hops; feeds rarely need more than two.
+MAX_REDIRECTS = 10
 FEED_CAP = 50 * 1024 * 1024
 SMALL_CAP = 5 * 1024 * 1024
 ARTWORK_CAP = 10 * 1024 * 1024
@@ -159,7 +163,7 @@ def fetch(url, cap=SMALL_CAP, timeout=DEFAULT_TIMEOUT, etag=None, last_modified=
     except urllib.error.HTTPError as error:
         if error.code == 304:
             raise NotModified()
-        raise FetchError("http", "server answered %d %s" % (error.code, error.reason or ""), status=error.code)
+        raise FetchError("http", _http_message(error), status=error.code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
     except NETWORK_ERRORS as error:
@@ -263,7 +267,7 @@ def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET"):
     except urllib.error.HTTPError as error:
         if error.code == 416:
             raise FetchError("http", "range not satisfiable", status=416)
-        raise FetchError("http", "server answered %d %s" % (error.code, error.reason or ""), status=error.code)
+        raise FetchError("http", _http_message(error), status=error.code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
     except NETWORK_ERRORS as error:
@@ -320,6 +324,17 @@ def _charset(content_type):
 
 def _dirname(path):
     return os.path.dirname(os.path.abspath(path)) or "."
+
+
+def _http_message(error):
+    """urllib reports a redirect chain over the limit as a 3xx 'infinite
+    loop'; say what happened in one line."""
+    reason = str(error.reason or "")
+    if 300 <= error.code < 400:
+        return "too many redirects (more than %d)" % MAX_REDIRECTS
+    if error.code == 403:
+        return "server answered 403 Forbidden (the host refuses this client)"
+    return "server answered %d %s" % (error.code, reason.splitlines()[0] if reason else "")
 
 
 def _short(error):

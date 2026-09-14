@@ -124,6 +124,7 @@ class Library:
             try:
                 parsed, response = await self.fetch_feed(url)
             except http.FetchError as error:
+                LOG.warning("preview of %s failed: %s", url, error.message)
                 raise protocol.ProtocolError(protocol.NETWORK, error.message)
             except feeds.FeedParseError as error:
                 raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
@@ -160,6 +161,7 @@ class Library:
             try:
                 parsed, response = await self.fetch_feed(url)
             except http.FetchError as error:
+                LOG.warning("subscribe to %s failed: %s", url, error.message)
                 raise protocol.ProtocolError(protocol.NETWORK, error.message)
             except feeds.FeedParseError as error:
                 raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))

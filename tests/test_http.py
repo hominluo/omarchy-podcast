@@ -19,6 +19,17 @@ class _Response:
         return self._buffer.read(min(size, self._step))
 
 
+class ClientIdentityTest(unittest.TestCase):
+    def test_user_agent_carries_no_url(self):
+        # feed.xyzfm.space and friends answer 403 to agents that name a URL.
+        self.assertNotIn("http", http.USER_AGENT.lower())
+        self.assertNotIn("github", http.USER_AGENT.lower())
+        self.assertTrue(http.USER_AGENT.startswith("Omarchy-Podcast/"))
+
+    def test_redirect_budget_covers_tracking_chains(self):
+        self.assertGreaterEqual(http.MAX_REDIRECTS, 8)
+
+
 class ReadCappedTest(unittest.TestCase):
     def test_plain_body(self):
         self.assertEqual(http._read_capped(_Response(b"hello"), 100), b"hello")
