@@ -354,6 +354,6 @@ MIT — see [LICENSE](LICENSE). Third-party notices are in [NOTICE.md](NOTICE.md
 <p align="center">
   Built by <a href="https://x.com/hominluo">@hominluo</a> ·
   <a href="https://github.com/hominluo">GitHub</a> ·
-  <a href="https://github.com/hominluo/Omarchy-Podcast/issues">Issues</a> ·
-  <a href="https://github.com/hominluo/Omarchy-Podcast/releases">Releases</a>
+  <a href="https://github.com/hominluo/omarchy-podcast/issues">Issues</a> ·
+  <a href="https://github.com/hominluo/omarchy-podcast/releases">Releases</a>
 </p>
