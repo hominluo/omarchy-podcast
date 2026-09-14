@@ -43,7 +43,7 @@ Item {
       case "upNext": return [["Enter", "Play"], ["x", "Remove"], ["J / K", "Move down / up"], ["X", "Clear Up Next"]]
       case "inbox": return [["Enter / p", "Play"], ["a", "Add to Up Next"], ["A", "Play next"], ["e", "Archive"], ["E", "Archive all"], ["d", "Download"]]
       case "downloads": return [["x", "Cancel or delete"], ["Enter", "Play"]]
-      case "discover": return [["Enter", "Subscribe / open"], ["u", "Add by RSS URL"], ["o", "Import OPML"]]
+      case "discover": return [["Enter", "Show details"], ["s", "Subscribe"], ["H / L", "Previous / next category"], ["/", "Search or paste a feed URL"], ["o", "Import OPML"], ["r", "Reload chart"]]
       case "settings": return [["Enter", "Edit"], ["j k", "Move"]]
       default: return []
     }

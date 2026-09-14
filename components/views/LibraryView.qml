@@ -91,7 +91,7 @@ Item {
       title: "Library"
       subtitle: {
         var n = service ? (service.library || []).length : 0
-        if (n === 0) return "Nothing yet — Discover finds podcasts by name, or paste a feed URL."
+        if (n === 0) return "Nothing yet — Browse has the charts, search by name, or paste a feed URL."
         var fresh = 0
         for (var i = 0; i < service.library.length; i++) fresh += Number(service.library[i].counts.new) || 0
         return n + (n === 1 ? " podcast" : " podcasts") + (fresh > 0 ? "  ·  " + fresh + " new" : "")
@@ -142,11 +142,30 @@ Item {
       }
     }
 
+    // `podcasts` is a fresh array on every library broadcast, which rebuilds
+    // the grid at the top; the settled position is put back (see EpisodeList).
+    property real _settledY: 0
+    property bool _swapping: false
+    function _captureY() { if (!_swapping) _settledY = grid.contentY }
+
     GridView {
       id: grid
       width: parent.width
       height: parent.height - y
       clip: true
+      // The cursor is ours; the view must not scroll on its own currentIndex.
+      highlightFollowsCurrentItem: false
+      keyNavigationEnabled: false
+      onContentYChanged: Qt.callLater(parent._captureY)
+      onModelChanged: {
+        var y = parent._settledY
+        parent._swapping = true
+        Qt.callLater(function() {
+          if (y > 0 && grid.contentHeight > grid.height && y <= grid.contentHeight - grid.height) grid.contentY = y
+          parent._settledY = grid.contentY
+          parent._swapping = false
+        })
+      }
       model: root.podcasts
       cellWidth: Style.space(128)
       cellHeight: Style.space(160)
@@ -179,7 +198,7 @@ Item {
     anchors.centerIn: parent
     visible: root.podcasts.length === 0
     textFormat: Text.PlainText
-    text: root.filter !== "" ? "No podcast matches “" + root.filter + "”" : "Press 5 (or click Discover) to find your first podcast."
+    text: root.filter !== "" ? "No podcast matches “" + root.filter + "”" : "Press 1 (or click Browse) to find your first podcast."
     color: browser.dim
     font.family: browser.fontFamily
     font.pixelSize: Style.font.body

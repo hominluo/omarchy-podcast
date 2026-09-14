@@ -1,13 +1,16 @@
 """Podcast discovery: Apple's catalogue by default, Podcast Index when the
 user has a key.
 
-Both providers return the same result shape so the Discover view does not
+Both providers return the same result shape so the Browse view does not
 care which answered. Apple's Search API is keyless but rate-limited (about
 twenty calls a minute, per-country); a token bucket and a short cache keep a
-search-as-you-type field under that. Podcast Index needs a free key, is
-worldwide, and adds trending shows and search by person.
+search-as-you-type field under that. Apple's top charts (per storefront,
+optionally per genre) are keyless too: the chart feed lists ids, one lookup
+call turns them into feeds. Podcast Index needs a free key, is worldwide, and
+adds trending shows and search by person.
 """
 
+import asyncio
 import datetime
 import hashlib
 import json
@@ -21,11 +24,34 @@ LOG = log.get("search")
 A = protocol.Arg
 
 ITUNES_SEARCH = "https://itunes.apple.com/search"
+ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
+# {cc}/rss/toppodcasts/limit=N[/genre=ID]/json — the old RSS generator still
+# answers and is the only keyless chart that knows about genres.
+ITUNES_CHART_BASE = "https://itunes.apple.com"
+# Genre-less fallback when a storefront has no old-style chart.
+ITUNES_MARKETING_BASE = "https://rss.marketingtools.apple.com/api/v2"
 PODCASTINDEX_BASE = "https://api.podcastindex.org/api/1.0/"
 CACHE_SECONDS = 15 * 60
 TRENDING_CACHE_SECONDS = 60 * 60
+CHARTS_CACHE_SECONDS = 6 * 3600
+STALE_CACHE_SECONDS = 7 * 86400
+# With a cached chart in hand, Apple gets this long before the cached one is
+# shown and the fetch finishes in the background.
+STALE_GRACE_SECONDS = 3
 ITUNES_PER_MINUTE = 15
 MAX_RESULTS = 50
+CHART_LIMIT = 50
+
+# Apple's top-level podcast genres (MZStoreServices genre tree, id 26), in
+# the order the Browse view offers them.
+GENRES = [
+    ("1303", "Comedy"), ("1489", "News"), ("1488", "True Crime"), ("1324", "Society & Culture"),
+    ("1321", "Business"), ("1304", "Education"), ("1318", "Technology"), ("1512", "Health & Fitness"),
+    ("1545", "Sports"), ("1487", "History"), ("1533", "Science"), ("1301", "Arts"), ("1309", "TV & Film"),
+    ("1310", "Music"), ("1483", "Fiction"), ("1305", "Kids & Family"), ("1502", "Leisure"),
+    ("1314", "Religion & Spirituality"), ("1511", "Government"),
+]
+GENRE_IDS = {gid for gid, _name in GENRES}
 
 
 class Unsupported(Exception):
@@ -114,6 +140,107 @@ class ITunesProvider:
     def trending(self, lang, cat, limit):
         raise Unsupported()
 
+    # ---- charts ------------------------------------------------------------
+
+    def charts(self, country, genre, limit):
+        """Top podcasts for a storefront, optionally within a genre, in chart
+        order with a `rank` on each result."""
+        cc = (country or "us").lower()[:2]
+        wait = self.bucket.take()
+        if wait:
+            raise protocol.ProtocolError(protocol.RATE_LIMITED, "Apple's catalogue is being asked too often; wait a moment", retryAfter=wait)
+        entries = self._chart_entries(cc, genre, limit)
+        if not entries:
+            return []
+        params = {"id": ",".join(entry["id"] for entry in entries), "entity": "podcast", "country": cc}
+        payload = self._json(ITUNES_LOOKUP + "?" + urllib.parse.urlencode(params))
+        by_id = {}
+        for item in payload.get("results", []) or []:
+            if isinstance(item, dict) and item.get("collectionId") is not None:
+                by_id[str(item["collectionId"])] = item
+        results = []
+        for rank, entry in enumerate(entries, 1):
+            item = by_id.get(entry["id"])
+            if item is None or not item.get("feedUrl"):
+                continue
+            genres = [g for g in (item.get("genres") or []) if isinstance(g, str) and g != "Podcasts"]
+            result = _result(
+                item.get("collectionName") or entry["name"], item.get("artistName") or entry["artist"], item["feedUrl"],
+                item.get("artworkUrl600") or entry["artwork"], entry["summary"], item.get("trackCount"),
+                item.get("collectionId"), None, _iso_to_epoch(item.get("releaseDate")), "", genres[:3])
+            result["rank"] = rank
+            results.append(result)
+        return results
+
+    def _chart_entries(self, cc, genre, limit):
+        try:
+            entries = self._chart_rss(cc, genre, limit)
+        except (http.FetchError, protocol.ProtocolError) as error:
+            if genre:
+                raise
+            LOG.info("old-style chart for %s unavailable (%s); trying the marketing feed", cc, getattr(error, "message", error))
+            return self._chart_marketing(cc, limit)
+        if not entries and not genre:
+            LOG.info("old-style chart for %s is empty; trying the marketing feed", cc)
+            return self._chart_marketing(cc, limit)
+        return entries
+
+    def _chart_rss(self, cc, genre, limit):
+        path = "/%s/rss/toppodcasts/limit=%d%s/json" % (cc, limit, ("/genre=%s" % genre) if genre else "")
+        payload = self._json(ITUNES_CHART_BASE + path)
+        feed = payload.get("feed") if isinstance(payload, dict) else None
+        entries = (feed or {}).get("entry") or []
+        if isinstance(entries, dict):          # a one-item chart comes as an object
+            entries = [entries]
+        parsed = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pid = str(_label(entry.get("id"), "attributes", "im:id") or "").strip()
+            if not pid.isdigit():
+                continue
+            images = entry.get("im:image") or []
+            artwork = _label(images[-1]) if isinstance(images, list) and images else ""
+            parsed.append({
+                "id": pid, "name": _label(entry.get("im:name")), "artist": _label(entry.get("im:artist")),
+                "artwork": str(artwork or ""), "summary": _label(entry.get("summary")),
+            })
+        return parsed
+
+    def _chart_marketing(self, cc, limit):
+        payload = self._json(ITUNES_MARKETING_BASE + "/%s/podcasts/top/%d/podcasts.json" % (cc, limit))
+        feed = payload.get("feed") if isinstance(payload, dict) else None
+        parsed = []
+        for item in (feed or {}).get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or "").strip()
+            if not pid.isdigit():
+                continue
+            artwork = str(item.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
+            parsed.append({"id": pid, "name": item.get("name"), "artist": item.get("artistName"), "artwork": artwork, "summary": ""})
+        return parsed
+
+    @staticmethod
+    def _json(url):
+        response = http.fetch(url, cap=http.SMALL_CAP, timeout=20, accept="application/json")
+        try:
+            payload = json.loads(response.body.decode("utf-8", "replace"))
+        except ValueError:
+            raise protocol.ProtocolError(protocol.NETWORK, "Apple's catalogue answered with something that is not JSON")
+        return payload if isinstance(payload, dict) else {}
+
+
+def _label(node, *path):
+    """Apple's RSS-as-JSON wraps every value: {"label": "..."} or nested
+    {"attributes": {...}}. Returns "" for anything missing."""
+    value = node
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    if isinstance(value, dict):
+        value = value.get("label")
+    return str(value or "").strip() if not isinstance(value, dict) else ""
+
 
 class PodcastIndexProvider:
     name = "podcastindex"
@@ -194,12 +321,22 @@ def _iso_to_epoch(value):
         return None
 
 
+def storefront(country, configured):
+    """The two-letter Apple storefront to ask, or a BAD_REQUEST that names the
+    setting: Apple answers 400/500 for an unknown code, which is no help."""
+    code = str(country or configured or "US").strip()
+    if len(code) != 2 or not code.isascii() or not code.isalpha():
+        raise protocol.ProtocolError(protocol.BAD_REQUEST, "%r is not a two-letter country code; set searchCountry to one (or auto)" % code)
+    return code.upper()
+
+
 class Search:
     def __init__(self, engine):
         self.engine = engine
         self.itunes = ITunesProvider()
         self._pi = None
         self._pi_key = ("", "")
+        self._inflight = {}          # chart cache key -> task, so bursts share one fetch
 
     async def start(self):
         self.engine.on_settings_changed(self._refresh_providers)
@@ -248,7 +385,9 @@ class Search:
             (key, json.dumps(results), now()))
 
     def prune_cache(self):
-        self.engine.store.execute("DELETE FROM search_cache WHERE fetched_at < ?", (now() - 24 * 3600,))
+        # Charts stay a week as a fallback for offline days; searches a day.
+        self.engine.store.execute("DELETE FROM search_cache WHERE key LIKE 'charts|%' AND fetched_at < ?", (now() - STALE_CACHE_SECONDS,))
+        self.engine.store.execute("DELETE FROM search_cache WHERE key NOT LIKE 'charts|%' AND fetched_at < ?", (now() - 24 * 3600,))
 
     # ---- public ------------------------------------------------------------
 
@@ -271,7 +410,7 @@ class Search:
         if len(query) < 2:
             return {"provider": "", "cached": True, "results": []}
         prov = self.provider_for(provider)
-        country = (country or self.engine.settings.country or "US").upper()[:2]
+        country = storefront(country, self.engine.settings.country)
         lang = lang or ""
         limit = max(1, min(MAX_RESULTS, int(limit)))
         cache_key = "|".join([prov.name, kind, query.lower(), country, lang, str(limit)])
@@ -284,6 +423,62 @@ class Search:
             raise protocol.ProtocolError(protocol.NETWORK, error.message)
         self._cache_put(cache_key, results)
         return {"provider": prov.name, "cached": False, "results": self._mark_subscribed(results)}
+
+    async def charts(self, country=None, genre=None, limit=CHART_LIMIT, refresh=False):
+        country = storefront(country, self.engine.settings.country)
+        genre = str(genre or "")
+        if genre and genre not in GENRE_IDS:
+            raise protocol.ProtocolError(protocol.BAD_REQUEST, "unknown genre %r" % genre)
+        limit = max(1, min(CHART_LIMIT, int(limit)))
+        cache_key = "|".join(["charts", country, genre, str(limit)])
+
+        def reply(results, cached, stale, **extra):
+            answer = {"provider": "itunes", "country": country, "genre": genre, "cached": cached, "stale": stale,
+                      "results": self._mark_subscribed(results)}
+            answer.update(extra)
+            return answer
+
+        # An empty list is never a chart worth keeping: a transient empty
+        # answer must not freeze the page for six hours.
+        cached = None if refresh else (self._cache_get(cache_key, CHARTS_CACHE_SECONDS) or None)
+        if cached is not None:
+            return reply(cached, True, False)
+        # A chart that is a few hours old beats an empty page, and beats a
+        # spinner: with one in hand Apple only gets a short grace period.
+        stale = self._cache_get(cache_key, STALE_CACHE_SECONDS) or None
+        task = self._inflight.get(cache_key)
+        if task is None:
+            task = self._inflight[cache_key] = asyncio.ensure_future(self._fetch_chart(cache_key, country, genre, limit))
+        if stale is not None:
+            done, _ = await asyncio.wait({task}, timeout=STALE_GRACE_SECONDS)
+            if not done:
+                LOG.warning("charts %s/%s: Apple is slow; serving the cached chart", country, genre or "top")
+                return reply(stale, True, True, reason="slow")
+        try:
+            results = await task
+        except (http.FetchError, protocol.ProtocolError) as error:
+            if stale is not None:
+                LOG.warning("charts %s/%s: serving the cached chart (%s)", country, genre or "top", getattr(error, "message", error))
+                extra = {}
+                if isinstance(error, protocol.ProtocolError) and error.code == protocol.RATE_LIMITED:
+                    extra = {"reason": "rate-limited", "retryAfter": error.extra.get("retryAfter")}
+                else:
+                    extra = {"reason": "unreachable"}
+                return reply(stale, True, True, **extra)
+            if isinstance(error, http.FetchError):
+                hint = "; is %s a real Apple storefront?" % country if error.status in (400, 404, 500) else ""
+                raise protocol.ProtocolError(protocol.NETWORK, error.message + hint)
+            raise
+        return reply(results, False, False)
+
+    async def _fetch_chart(self, cache_key, country, genre, limit):
+        try:
+            results = await self.engine.run_in_thread(self.itunes.charts, country, genre, limit)
+            if results:
+                self._cache_put(cache_key, results)
+            return results
+        finally:
+            self._inflight.pop(cache_key, None)
 
     async def trending(self, lang=None, cat=None, limit=25):
         if self._pi is None:
@@ -317,3 +512,16 @@ async def cmd_search(engine, client, query, kind, provider, country, lang, limit
                   limit=A(int, required=False, default=25, minimum=1, maximum=MAX_RESULTS))
 async def cmd_trending(engine, client, lang, cat, limit):
     return await engine.search.trending(lang, cat, limit)
+
+
+@protocol.command("charts", "Top podcasts for a region, optionally within a genre (Apple)",
+                  country=A(str, required=False), genre=A(str, required=False),
+                  limit=A(int, required=False, default=CHART_LIMIT, minimum=1, maximum=CHART_LIMIT),
+                  refresh=A(bool, required=False, default=False))
+async def cmd_charts(engine, client, country, genre, limit, refresh):
+    return await engine.search.charts(country, genre, limit, refresh)
+
+
+@protocol.command("genres", "The chart genres Browse can ask for")
+def cmd_genres(engine, client):
+    return {"genres": [{"id": gid, "name": name} for gid, name in GENRES]}

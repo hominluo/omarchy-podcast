@@ -82,6 +82,16 @@ function chapterIndexAt(chapters, t) {
   return indexAtTime(chapters, t)
 }
 
+// The same folding as engine/search.py canonical_feed_url: http/https twins,
+// host case and a trailing slash never make two feeds different.
+function canonicalFeedUrl(url) {
+  var text = String(url || "").trim()
+  var m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?/.exec(text)
+  if (!m) return text
+  var path = m[3].replace(/\/+$/, "") || "/"
+  return "https://" + m[2].toLowerCase() + path + (m[4] || "")
+}
+
 // Plain text on its way into a RichText Text: the four characters that would
 // otherwise be read as markup.
 function escapeHtml(text) {
@@ -206,6 +216,6 @@ if (typeof module !== "undefined") {
     formatRelativeDate: formatRelativeDate, elide: elide, indexAtTime: indexAtTime, chapterIndexAt: chapterIndexAt,
     segmentIndexAt: segmentIndexAt, nextSpeed: nextSpeed, formatSpeed: formatSpeed, sleepLabel: sleepLabel,
     filterEpisodes: filterEpisodes, searchMatches: searchMatches, patchById: patchById, removeById: removeById,
-    sanitizeShowNotes: sanitizeShowNotes, stripTags: stripTags, escapeHtml: escapeHtml, progressFraction: progressFraction, formatBytes: formatBytes,
+    sanitizeShowNotes: sanitizeShowNotes, stripTags: stripTags, escapeHtml: escapeHtml, canonicalFeedUrl: canonicalFeedUrl, progressFraction: progressFraction, formatBytes: formatBytes,
   }
 }

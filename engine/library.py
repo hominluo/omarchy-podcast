@@ -12,6 +12,7 @@ import json
 import os
 import random
 import sqlite3
+import time
 
 from . import feeds, http, log, models, protocol
 from .search import canonical_feed_url
@@ -23,6 +24,16 @@ A = protocol.Arg
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5"
 REFRESH_CONCURRENCY = 4
 INBOX_PAGE = 50
+PREVIEW_CACHE_SECONDS = 15 * 60
+PREVIEW_CACHE_SIZE = 12   # parsed feeds are kept too, so keep this small
+
+
+def _checked_url(feed_url):
+    """User-typed links: a bad one is a bad request, not an internal error."""
+    try:
+        return http.check_url(feed_url)
+    except http.FetchError as error:
+        raise protocol.ProtocolError(protocol.BAD_REQUEST, error.message)
 
 
 class Library:
@@ -30,6 +41,7 @@ class Library:
         self.engine = engine
         self.store = None
         self._refreshing = set()
+        self._previews = {}           # feed url -> (monotonic stamp, (podcast, episodes))
         self._semaphore = None
         self._jobs_total = 0
         self._jobs_done = 0
@@ -101,38 +113,56 @@ class Library:
     # ---- subscribe / unsubscribe -------------------------------------------
 
     async def preview(self, feed_url):
-        url = http.check_url(feed_url)
-        try:
-            parsed, _ = await self.fetch_feed(url)
-        except http.FetchError as error:
-            raise protocol.ProtocolError(protocol.NETWORK, error.message)
-        except feeds.FeedParseError as error:
-            raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
-        existing = self.store.one("SELECT id FROM podcasts WHERE feed_url = ?", (url,))
-        podcast = dict(parsed["podcast"])
+        """A feed's show page without subscribing: podcast fields plus the
+        latest episodes. Browsing flips between shows, so a fetched feed is
+        kept for a while; the subscribed flag is always fresh."""
+        url = _checked_url(feed_url)
+        cached = self._previews.get(url)
+        if cached is not None and time.monotonic() - cached[0] < PREVIEW_CACHE_SECONDS:
+            podcast, episodes = cached[1]
+        else:
+            try:
+                parsed, response = await self.fetch_feed(url)
+            except http.FetchError as error:
+                raise protocol.ProtocolError(protocol.NETWORK, error.message)
+            except feeds.FeedParseError as error:
+                raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
+            podcast = dict(parsed["podcast"])
+            podcast["episodeCount"] = len(parsed["episodes"])
+            episodes = []
+            for ep in parsed["episodes"][:20]:
+                episodes.append({
+                    "title": ep["title"], "pubDate": ep["pub_date"], "duration": ep["duration"],
+                    "enclosureUrl": ep["enclosure_url"], "notesText": ep["notes_text"][:220],
+                    "artwork": ep["image_url"] or podcast.get("image_url", ""),
+                })
+            if len(self._previews) >= PREVIEW_CACHE_SIZE:
+                oldest = min(self._previews, key=lambda key: self._previews[key][0])
+                del self._previews[oldest]
+            # The parsed feed and its response stay too: subscribing right
+            # after a preview must not download the whole feed again.
+            self._previews[url] = (time.monotonic(), (podcast, episodes), (parsed, response))
+        podcast = dict(podcast)
+        existing = self._podcast_by_url(url)
         podcast["subscribed"] = existing is not None
         podcast["podcastId"] = existing["id"] if existing else None
-        podcast["episodeCount"] = len(parsed["episodes"])
-        episodes = []
-        for ep in parsed["episodes"][:20]:
-            episodes.append({
-                "title": ep["title"], "pubDate": ep["pub_date"], "duration": ep["duration"],
-                "enclosureUrl": ep["enclosure_url"], "notesText": ep["notes_text"][:220],
-                "artwork": ep["image_url"] or podcast.get("image_url", ""),
-            })
-        return {"podcast": podcast, "episodes": episodes}
+        return {"podcast": podcast, "episodes": list(episodes)}
 
     async def subscribe(self, feed_url):
-        url = http.check_url(feed_url)
+        url = _checked_url(feed_url)
         existing = self._podcast_by_url(url)
         if existing is not None:
             return models.podcast_summary(self.require_podcast(existing["id"]))
-        try:
-            parsed, response = await self.fetch_feed(url)
-        except http.FetchError as error:
-            raise protocol.ProtocolError(protocol.NETWORK, error.message)
-        except feeds.FeedParseError as error:
-            raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
+        cached = self._previews.get(url)
+        if cached is not None and time.monotonic() - cached[0] < PREVIEW_CACHE_SECONDS:
+            parsed, response = cached[2]
+        else:
+            try:
+                parsed, response = await self.fetch_feed(url)
+            except http.FetchError as error:
+                raise protocol.ProtocolError(protocol.NETWORK, error.message)
+            except feeds.FeedParseError as error:
+                raise protocol.ProtocolError(protocol.BAD_REQUEST, str(error))
 
         # The fetch took a while: a double click or a sync pull may have
         # subscribed meanwhile, and a redirect may have landed on a feed that

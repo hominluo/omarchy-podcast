@@ -33,6 +33,25 @@ class LibraryTest(unittest.TestCase):
     def tearDown(self):
         self.http.close()
 
+    def test_preview_then_subscribe_reuses_the_fetch(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                preview = await h.engine.library.preview(self.feed_url)
+                self.assertFalse(preview["podcast"]["subscribed"])
+                self.assertEqual(len(preview["episodes"]), preview["podcast"]["episodeCount"])
+                fetches = len([r for r in self.http.requests if r[1] == "/feed.xml"])
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                self.assertEqual(len([r for r in self.http.requests if r[1] == "/feed.xml"]), fetches)
+                self.assertEqual(h.engine.store.scalar("SELECT etag FROM podcasts WHERE id = ?", (podcast["id"],)), '"v1"')
+                again = await h.engine.library.preview(self.feed_url)
+                self.assertTrue(again["podcast"]["subscribed"])
+                self.assertEqual(again["podcast"]["podcastId"], podcast["id"])
+                for bad in ("https://", "https:///x.xml", "ftp://x/y", "https://[::1"):
+                    with self.assertRaises(protocol.ProtocolError) as caught:
+                        await h.engine.library.preview(bad)
+                    self.assertEqual(caught.exception.code, protocol.BAD_REQUEST)
+        run(scenario())
+
     def test_subscribe_inbox_and_refresh(self):
         async def scenario():
             async with EngineHarness(attach) as h:

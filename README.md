@@ -87,7 +87,7 @@ library.
 | `s` / `S` | faster / slower |
 | `z` | sleep timer: off → default → 45 → 60 min → end of episode → end of chapter |
 | `x` | remove the Up Next row under the cursor |
-| `b` `q` `i` `t` `/` | open the library on Library / Up Next / Inbox / Transcript / Discover |
+| `b` `q` `i` `t` `/` | open the window on Library / Up Next / Inbox / Transcript / Browse |
 | `r` | refresh every feed |
 | `Tab` | move to the next bar panel |
 | `Esc` | close |
@@ -98,23 +98,30 @@ Bind a key to it if you like (`~/.config/hypr/bindings.lua`):
 o.bind("SUPER + SHIFT + P", "Podcast", "omarchy-shell shell toggle io.github.hominluo.podcast '{}'")
 ```
 
-That opens the library window. For the dropdown use
+That opens the window. For the dropdown use
 `omarchy-shell io.github.hominluo.podcast.panel toggle`.
 
-## The library window
+## The window
 
-A full-screen modal in the style of Omarchy's launcher, with a sidebar of views:
+A full-screen modal in the style of Omarchy's launcher. It opens on **Browse**,
+and a sidebar leads to the other views:
 
+- **Browse** — the top podcasts for your region, overall or by genre (Comedy,
+  News, True Crime, …), straight from Apple's charts with no account or key.
+  Type to search the catalogue as you type, paste a feed URL to read any feed,
+  or import an OPML file. `Enter` on a show opens it in the pane on the right
+  with its description and latest episodes; `s` (or **Subscribe**) adds it to
+  the library. `H` / `L` step through the genres, `r` reloads the chart, and
+  the region menu in the corner switches storefronts (it follows your locale
+  by default). With a Podcast Index key a **Trending** chip appears too.
+- **Library** — every podcast, with how many episodes wait.
 - **Now Playing** — large artwork and controls, with the transcript, the
   chapters or the show notes beside them.
-- **Library** — every podcast, with how many episodes wait.
 - **Up Next** — the listening queue, reorderable.
 - **Inbox** — new episodes. Play them, add them to Up Next, or archive them.
   When you subscribe, only the newest episode lands here; the back catalogue
   stays in the podcast's own page.
 - **Downloads** — what is on disk and what is on its way.
-- **Discover** — search Apple's catalogue as you type, paste a feed URL, import
-  an OPML file, or browse what is trending (with a Podcast Index key).
 - **Settings**.
 
 Everywhere:
@@ -206,7 +213,8 @@ starts on demand and which keeps running (and playing) across `omarchy restart
 shell`.
 
 What it talks to: the feeds you subscribe to and their artwork hosts;
-`itunes.apple.com` for search; `api.podcastindex.org` only if you add a key;
+`itunes.apple.com` (and `rss.marketingtools.apple.com`) for search and the
+charts; `api.podcastindex.org` only if you add a key;
 `huggingface.co` once per model when you first transcribe; and the sync server
 you configure. Nothing is sent anywhere otherwise.
 

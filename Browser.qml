@@ -29,7 +29,7 @@ Item {
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "io.github.hominluo.podcast"
 
   property bool opened: false
-  property string view: "library"
+  property string view: "discover"
   property var viewArgs: ({})
   property var history: []
   property string pane: "main"          // "sidebar" | "main" | "detail"
@@ -65,12 +65,12 @@ Item {
   // ---- sidebar -------------------------------------------------------------
   readonly property var sidebarItems: {
     var items = []
-    if (hasEpisode) items.push({ view: "nowPlaying", label: "Now Playing", glyph: "󰐊", count: 0 })
+    items.push({ view: "discover", label: "Browse", glyph: "󰆋", count: 0 })
     items.push({ view: "library", label: "Library", glyph: "󰌱", count: service ? (service.library || []).length : 0 })
+    if (hasEpisode) items.push({ view: "nowPlaying", label: "Now Playing", glyph: "󰐊", count: 0 })
     items.push({ view: "upNext", label: "Up Next", glyph: "󰐑", count: service ? (service.queue || []).length : 0 })
     items.push({ view: "inbox", label: "Inbox", glyph: "󰚇", count: service && service.inbox ? Number(service.inbox.count) || 0 : 0 })
     items.push({ view: "downloads", label: "Downloads", glyph: "󰇚", count: service ? (service.downloads || []).length : 0 })
-    items.push({ view: "discover", label: "Discover", glyph: "󰍉", count: 0 })
     items.push({ view: "settings", label: "Settings", glyph: "󰒓", count: 0 })
     return items
   }
@@ -96,11 +96,15 @@ Item {
       // A plain reopen keeps the view where it was; only views that cannot
       // stand without their arguments fall back to the library.
       root.history = []
-      if (view === "nowPlaying" && !hasEpisode) root.view = "library"
-      else if (view === "podcast" && !(root.viewArgs && root.viewArgs.podcastId)) root.view = "library"
+      if (view === "nowPlaying" && !hasEpisode) root.view = "discover"
+      else if (view === "podcast" && !(root.viewArgs && root.viewArgs.podcastId)) root.view = "discover"
       // Episode-scoped arguments do not outlive the window: Now Playing
       // follows the player again on reopen.
       if (root.view !== "podcast") root.viewArgs = {}
+      // A view kept alive across a close gets told it is back (Browse
+      // refocuses its search field, the launcher way).
+      var current = viewLoader.item
+      if (current && typeof current.activated === "function") Qt.callLater(function() { if (root.opened && viewLoader.item === current) current.activated() })
     }
     root.refocus()
   }

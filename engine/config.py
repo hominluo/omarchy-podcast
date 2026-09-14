@@ -185,7 +185,7 @@ class Settings:
     def country(self):
         code = str(self.get("searchCountry") or "auto").strip()
         if code and code.lower() != "auto":
-            return code.upper()[:2]
+            return code.upper()   # validated where it is used, so a typo can be named
         return country_from_locale(self.locale or os.environ.get("LANG", ""))
 
     @property

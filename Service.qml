@@ -462,6 +462,12 @@ Item {
     root.request("search", params, callback)
   }
   function trending(options, callback) { root.request("trending", options || {}, callback) }
+  function charts(options, callback) { root.request("charts", options || {}, callback) }
+  function genres(callback) { root.request("genres", {}, callback) }
+
+  // What the Browse view was showing, so coming back lands on the same
+  // chart with the same region (the view is rebuilt on every visit).
+  property var browseState: ({ genre: "", region: "auto", query: "" })
 
   // ---- downloads ---------------------------------------------------------
   function download(episodeIds) {

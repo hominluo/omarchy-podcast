@@ -109,7 +109,10 @@ def check_url(url):
     text = str(url or "").strip()
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         raise FetchError("bad-url", "the link contains control characters")
-    parts = urllib.parse.urlsplit(text)
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError as error:
+        raise FetchError("bad-url", "that is not a valid link: %s" % error)
     if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
         raise FetchError("bad-url", "only http and https links can be fetched")
     try:

@@ -90,6 +90,13 @@ test("escapeHtml neutralises markup", () => {
   assert.equal(M.escapeHtml(null), "")
 })
 
+test("canonicalFeedUrl folds twins like the daemon", () => {
+  assert.equal(M.canonicalFeedUrl("http://Feeds.Example.com/show/"), "https://feeds.example.com/show")
+  assert.equal(M.canonicalFeedUrl("https://feeds.example.com/show?x=1#frag"), "https://feeds.example.com/show?x=1")
+  assert.equal(M.canonicalFeedUrl("https://host"), "https://host/")
+  assert.equal(M.canonicalFeedUrl("not a url"), "not a url")
+})
+
 test("formatBytes", () => {
   assert.equal(M.formatBytes(512), "512 B")
   assert.equal(M.formatBytes(1536), "1.5 KB")
