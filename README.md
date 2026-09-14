@@ -2,21 +2,23 @@
 
 <p align="center">
   A native podcast player for the <a href="https://omarchy.org">Omarchy</a> shell —
-  a bar widget, a now-playing dropdown, and a launcher-style library window.
+  a bar widget, a now-playing dropdown, and a launcher-style window that opens on the charts.
 </p>
 
 <p align="center">
-  <img src="docs/bar.png" alt="The bar: a podcast glyph with the episode title scrolling beside it" height="26">
+  <img src="docs/bar.png" alt="The bar: a podcast glyph with the episode title beside it" height="26">
 </p>
 
 <p align="center">
-  <img src="preview.png" alt="The library window on Now Playing, with the transcript following the audio" width="720">
+  <img src="preview.png" alt="Browse: the top podcasts for your region, with a show open in the pane on the right" width="820">
 </p>
 
 <p align="center">
   <a href="#install">Install</a> ·
-  <a href="#the-bar-and-the-dropdown">The bar</a> ·
-  <a href="#the-library-window">The library window</a> ·
+  <a href="#browse">Browse</a> ·
+  <a href="#listen">Listen</a> ·
+  <a href="#the-library">Library</a> ·
+  <a href="#the-bar-and-the-dropdown">Bar & dropdown</a> ·
   <a href="#transcripts">Transcripts</a> ·
   <a href="#sync">Sync</a> ·
   <a href="#settings">Settings</a> ·
@@ -25,12 +27,25 @@
 
 ---
 
-Subscriptions, an Up Next queue, an inbox for new episodes, downloads for
-offline listening, chapters, per-podcast speed, silence skipping, voice boost,
-a sleep timer, transcripts that follow the audio (from the feed, or made on
-your own machine with whisper.cpp), and sync with gpodder.net or Nextcloud —
-drawn with your Omarchy theme, driven from the keyboard, and playing through
-`mpv` so the media keys and Omarchy's own media widget just work.
+Open the window and the top podcasts for your region are already there — by
+genre, searchable as you type, subscribable with one key. Everything else a
+podcast player should do is here too: an Up Next queue, an inbox for new
+episodes, downloads for offline listening, chapters, per-podcast speed,
+silence skipping, voice boost, a sleep timer, transcripts that follow the
+audio (from the feed, or made on your own machine with whisper.cpp), and sync
+with gpodder.net or Nextcloud. It is drawn with your Omarchy theme, driven
+from the keyboard, and plays through `mpv`, so the media keys and Omarchy's
+own media widget just work.
+
+| | |
+|---|---|
+| **Browse** | Apple's top 50 for your region, overall or in any of 19 genres — no account, no key. Search the catalogue as you type, paste any feed URL, or import an OPML file. |
+| **Show pages before you subscribe** | Description and the latest episodes in a pane on the right; `s` subscribes. |
+| **Listen** | Up Next, an inbox that only shows what is new, resume everywhere, chapters on the seek bar, per-podcast speed, silence skipping, voice boost, a sleep timer that fades out. |
+| **Transcripts** | The feed's own (VTT, SRT, JSON, HTML, text) or a local whisper.cpp run on your GPU — highlighted and kept in view as the audio plays, searchable, click to seek. |
+| **Offline** | Downloads with resume, automatic for the newest episode of each show, cleaned up after they are played. |
+| **Sync** | gpodder.net or Nextcloud GPodder Sync: subscriptions and positions, both ways. |
+| **Native** | One `mpv` on MPRIS, one stdlib-only Python engine that survives shell restarts, QML that only ever reads state — and every colour, spacing and font from your theme. |
 
 ## Install
 
@@ -73,10 +88,14 @@ scrolling beside it.
 | scroll wheel | seek 15 s (turn off in settings) |
 | media keys | play/pause, next, previous — through MPRIS, like any player |
 
+<p align="center">
+  <img src="docs/panel.webp" alt="The dropdown: artwork, seek bar, transport, toggles and Up Next" width="400">
+</p>
+
 The dropdown holds the artwork, the seek bar with chapter notches, skip back /
 play / skip forward, the speed and sleep-timer chips, the silence-skipping and
 voice-boost toggles, the first few episodes of Up Next, and the way into the
-library.
+window.
 
 | Key | Result |
 |---|---|
@@ -87,7 +106,7 @@ library.
 | `s` / `S` | faster / slower |
 | `z` | sleep timer: off → default → 45 → 60 min → end of episode → end of chapter |
 | `x` | remove the Up Next row under the cursor |
-| `b` `q` `i` `t` `/` | open the window on Library / Up Next / Inbox / Transcript / Browse |
+| `b` `q` `i` `t` `/` | open the window on Library / Up Next / Inbox / Now Playing / Browse |
 | `r` | refresh every feed |
 | `Tab` | move to the next bar panel |
 | `Esc` | close |
@@ -101,30 +120,75 @@ o.bind("SUPER + SHIFT + P", "Podcast", "omarchy-shell shell toggle io.github.hom
 That opens the window. For the dropdown use
 `omarchy-shell io.github.hominluo.podcast.panel toggle`.
 
-## The window
+## Browse
 
-A full-screen modal in the style of Omarchy's launcher. It opens on **Browse**,
-and a sidebar leads to the other views:
+<p align="center">
+  <img src="docs/browse.webp" alt="Browse: Top charts with the genre strip" width="820">
+</p>
 
-- **Browse** — the top podcasts for your region, overall or by genre (Comedy,
-  News, True Crime, …), straight from Apple's charts with no account or key.
-  Type to search the catalogue as you type, paste a feed URL to read any feed,
-  or import an OPML file. `Enter` on a show opens it in the pane on the right
-  with its description and latest episodes; `s` (or **Subscribe**) adds it to
-  the library. `H` / `L` step through the genres, `r` reloads the chart, and
-  the region menu in the corner switches storefronts (it follows your locale
-  by default). With a Podcast Index key a **Trending** chip appears too.
-- **Library** — every podcast, with how many episodes wait.
-- **Now Playing** — large artwork and controls, with the transcript, the
-  chapters or the show notes beside them.
-- **Up Next** — the listening queue, reorderable.
-- **Inbox** — new episodes. Play them, add them to Up Next, or archive them.
-  When you subscribe, only the newest episode lands here; the back catalogue
-  stays in the podcast's own page.
-- **Downloads** — what is on disk and what is on its way.
-- **Settings**.
+The window opens on **Browse**: the top podcasts for your region, straight
+from Apple's charts, with a strip of genres above the grid — Comedy, News,
+True Crime, Society & Culture, Business, Technology and the rest. `H` / `L`
+step through them, `r` reloads, and the region menu in the corner switches
+storefronts (it follows your locale by default). With a Podcast Index key a
+**Trending** chip appears too.
 
-Everywhere:
+<p align="center">
+  <img src="docs/browse-search.webp" alt="Searching the catalogue as you type" width="820">
+</p>
+
+Type and the grid becomes search results as you type. Paste a feed URL
+instead and `Enter` reads that feed; **Import OPML** takes a whole list.
+
+<p align="center">
+  <img src="docs/browse-show.webp" alt="A show open in the pane: description, latest episodes, Subscribe" width="820">
+</p>
+
+`Enter` (or a click) opens a show in the pane on the right with its
+description and latest episodes. **Subscribe** — or `s` from the grid — adds
+it to the library; the feed read for the preview is reused, so it is instant.
+Subscribed shows carry a tick on their tile.
+
+## Listen
+
+<p align="center">
+  <img src="docs/nowPlaying.webp" alt="Now Playing with the transcript following the audio" width="820">
+</p>
+
+**Now Playing** has the artwork and the controls, with the transcript, the
+chapters or the show notes beside them. The current paragraph is highlighted
+and kept in view as the audio plays; click any line to jump there.
+
+<p align="center">
+  <img src="docs/inbox.webp" alt="The inbox: one new episode per show" width="820">
+</p>
+
+**Inbox** holds only what is new. Play an episode, add it to Up Next (`a`,
+or `A` to play it next), or archive it (`e`); `Q` queues everything and `E`
+archives everything. When you subscribe, only the newest episode lands here —
+the back catalogue stays on the show's own page.
+
+**Up Next** is the queue: reorder with `J` / `K`, remove with `x`, and when an
+episode ends the next one starts. **Downloads** shows what is on disk and
+what is on its way.
+
+## The library
+
+<p align="center">
+  <img src="docs/library.webp" alt="The library grid with unplayed counts" width="820">
+</p>
+
+<p align="center">
+  <img src="docs/podcast.webp" alt="A podcast page: episodes, filters, and an episode open in the detail pane" width="820">
+</p>
+
+Every show has a page with its episodes (all, unplayed, downloaded — or `/`
+to filter), its own speed and auto-download settings, and whether new
+episodes go to the inbox. An episode opens in the detail pane with play,
+Up Next, download, played and archive buttons, then the show notes (links
+open in your browser only when you click them) and chapters.
+
+### Keys, everywhere in the window
 
 | Key | Result |
 |---|---|

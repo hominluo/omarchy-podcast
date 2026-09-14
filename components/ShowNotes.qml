@@ -26,6 +26,9 @@ Flickable {
     text = text.replace(/<\s*img[^>]*>/gi, "")
     text = text.replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
     text = text.replace(/href\s*=\s*("|')\s*javascript:[^"']*\1/gi, 'href="#"')
+    // Qt's rich text paints links with its own palette blue regardless of
+    // linkColor; the theme's accent goes on the anchor itself.
+    text = text.replace(/<a\s+href=/gi, '<a style="color:' + String(Color.accent) + '" href=')
     return text
   }
 
