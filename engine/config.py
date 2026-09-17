@@ -17,7 +17,7 @@ import os
 import socket
 import tempfile
 
-from . import PLUGIN_ID
+from . import PLUGIN_ID, fsio
 
 MANIFEST_NAME = "manifest.json"
 CREDENTIALS_NAME = "credentials.json"
@@ -250,21 +250,8 @@ def load_credentials(paths):
 
 
 def save_credentials(paths, data):
-    """Atomic 0600 write: a temp file in the same directory, then rename."""
-    os.makedirs(paths.config_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".credentials.", dir=paths.config_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, paths.credentials_path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    """Atomic 0600 write: an unpredictable temp beside the file, then rename."""
+    fsio.atomic_write(paths.credentials_path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 __all__ = [

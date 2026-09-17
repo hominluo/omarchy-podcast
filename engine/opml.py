@@ -5,7 +5,7 @@ import time
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import quoteattr
 
-from . import log, protocol
+from . import fsio, log, protocol
 
 LOG = log.get("opml")
 A = protocol.Arg
@@ -81,10 +81,8 @@ def export_file(engine, path=None):
     if not path:
         path = os.path.join(engine.settings.download_dir, "subscriptions.opml")
     path = os.path.expanduser(str(path))
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     podcasts = engine.library.library_list()
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(render(podcasts))
+    fsio.atomic_write(path, render(podcasts), mode=0o644)
     return {"path": path, "count": len(podcasts)}
 
 

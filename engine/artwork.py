@@ -12,7 +12,7 @@ import hashlib
 import os
 import subprocess
 
-from . import http, log
+from . import fsio, http, log
 from .store import now
 
 LOG = log.get("artwork")
@@ -76,12 +76,15 @@ class ArtworkCache:
         kind = _sniff(data)
         if not kind:
             return ""
-        os.makedirs(self.dir, exist_ok=True)
-        tmp_in = target + ".src"
-        tmp_out = target + ".part.jpg"
+        # Both temps get unpredictable names we created ourselves; ffmpeg's -y
+        # then overwrites the empty output file we hand it.
+        fd_in, tmp_in = fsio.open_new(self.dir, ".art-", ".src")
+        tmp_out = ""
         try:
-            with open(tmp_in, "wb") as handle:
+            with os.fdopen(fd_in, "wb") as handle:
                 handle.write(data)
+            fd_out, tmp_out = fsio.open_new(self.dir, ".art-", ".jpg")
+            os.close(fd_out)
             argv = [
                 "ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", tmp_in, "-frames:v", "1",
                 "-vf", "scale='min(%d,iw)':-2" % MAX_EDGE, "-q:v", "3", "-f", "image2", tmp_out,
@@ -102,10 +105,11 @@ class ArtworkCache:
             return ""
         finally:
             for path in (tmp_in, tmp_out):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     # ---- async API ---------------------------------------------------------
 

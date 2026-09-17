@@ -16,7 +16,7 @@ import signal
 import sys
 import time
 
-from . import PLUGIN_ID, PROTOCOL, VERSION, log, protocol
+from . import PLUGIN_ID, PROTOCOL, VERSION, fsio, log, protocol
 from .config import Paths, Settings, load_credentials, manifest_defaults, manifest_version, save_credentials
 from .server import Server
 from .store import Store
@@ -155,9 +155,9 @@ class Engine:
 
     def _write_info(self):
         try:
-            with open(self.paths.info_path, "w", encoding="utf-8") as handle:
-                json.dump({"pid": os.getpid(), "version": VERSION, "protocol": PROTOCOL,
-                           "startedAt": self.started_at, "socket": self.paths.socket_path}, handle)
+            fsio.atomic_write(self.paths.info_path, json.dumps({
+                "pid": os.getpid(), "version": VERSION, "protocol": PROTOCOL,
+                "startedAt": self.started_at, "socket": self.paths.socket_path}))
         except OSError:
             pass
 

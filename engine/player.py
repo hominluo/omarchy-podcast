@@ -20,7 +20,7 @@ import os
 import subprocess
 import time
 
-from . import VERSION, log
+from . import VERSION, fsio, log
 
 LOG = log.get("player")
 
@@ -180,8 +180,7 @@ class MpvClient:
             return False
         self._spawns.append(time.monotonic())
         try:
-            with open(self.paths.mpv_pid_path, "w", encoding="ascii") as handle:
-                handle.write(str(self.process.pid))
+            fsio.atomic_write(self.paths.mpv_pid_path, str(self.process.pid))
         except OSError:
             pass
         LOG.info("started mpv (pid %d)", self.process.pid)

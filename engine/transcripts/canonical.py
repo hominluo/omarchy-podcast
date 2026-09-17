@@ -13,7 +13,8 @@ import hashlib
 import json
 import math
 import os
-import tempfile
+
+from .. import fsio
 
 VERSION = 1
 
@@ -72,18 +73,7 @@ def load(path):
 
 
 def save(path, doc):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".transcript.", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(doc, handle, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    fsio.atomic_write(path, json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
 
 
 def paragraphs(segments, max_chars=320, max_seconds=14.0):

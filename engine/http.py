@@ -11,14 +11,13 @@ import io
 import os
 import socket
 import ssl
-import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
 
-from . import VERSION, log
+from . import VERSION, fsio, log
 
 LOG = log.get("http")
 
@@ -288,9 +287,9 @@ def download_to_file(url, path, cap, timeout=DEFAULT_TIMEOUT, headers=None):
     Returns the Response with an empty body but the real headers."""
     response = open_stream(url, timeout=timeout, headers=headers)
     total = 0
-    fd, tmp = tempfile.mkstemp(prefix=".dl.", dir=_dirname(path))
+    fd, tmp = fsio.open_new(_dirname(path), ".dl.")
     try:
-        with open(fd, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             started = time.monotonic()
             while True:
                 chunk = read_chunk(response)

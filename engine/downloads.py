@@ -13,12 +13,13 @@ goes out as events at most twice a second per job.
 import asyncio
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
 import unicodedata
 
-from . import http, log, models, protocol
+from . import fsio, http, log, models, protocol
 from .store import now
 
 LOG = log.get("downloads")
@@ -388,7 +389,9 @@ class Downloads:
             raise http.FetchError("bad-url", "episode vanished")
         stored = self.store.one("SELECT path, temp_path, etag, last_modified FROM downloads WHERE episode_id = ?", (job.episode_id,))
         path = stored["path"] if stored and stored["path"] else self._target_path(row, job.keep)
-        part = stored["temp_path"] if stored and stored["temp_path"] else path + ".part"
+        # The partial file's name is unpredictable and remembered in the row,
+        # so a resume finds it again while nobody else can guess it.
+        part = stored["temp_path"] if stored and stored["temp_path"] else "%s.%s.part" % (path, secrets.token_hex(6))
         self.store.execute("UPDATE downloads SET path = ?, temp_path = ? WHERE episode_id = ?", (path, part, job.episode_id))
         return {
             "url": row["enclosure_url"], "path": path, "part": part,
@@ -435,7 +438,7 @@ class Downloads:
             last_rate_at = time.monotonic()
             last_rate_bytes = job.bytes_done
             last_progress_at = last_rate_at
-            with open(part, mode) as handle:
+            with os.fdopen(_open_part(part, mode), mode) as handle:
                 while True:
                     if job.cancel.is_set():
                         raise Cancelled()
@@ -581,6 +584,18 @@ class Downloads:
             if freed > 100 * 1024 * 1024:
                 self.engine.notice("info", "Cleaned up %d MB of played downloads" % (freed // (1024 * 1024)))
         return {"removed": len(removed), "freed": freed}
+
+
+def _open_part(part, mode):
+    """Open a partial file for a fresh ("wb") or resumed ("ab") transfer
+    without ever following a symlink standing in its place."""
+    if mode == "wb":
+        try:
+            os.unlink(part)
+        except FileNotFoundError:
+            pass
+        return fsio.open_nofollow(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    return fsio.open_nofollow(part, os.O_WRONLY | os.O_APPEND)
 
 
 def _remove(path):

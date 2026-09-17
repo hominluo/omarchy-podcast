@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 
-from .. import http, log
+from .. import fsio, http, log
 from .canonical import segment
 
 LOG = log.get("whisper")
@@ -152,7 +152,15 @@ def download_model(models_dir, model, progress=None, cancel=None):
         total_header = response.headers.get("Content-Length")
         total = (done + int(total_header)) if total_header and total_header.isdigit() and mode == "ab" else (int(total_header) if total_header and total_header.isdigit() else expected)
         last = 0.0
-        with open(part, mode) as handle:
+        if mode == "wb":
+            try:
+                os.unlink(part)
+            except FileNotFoundError:
+                pass
+            fd = fsio.open_nofollow(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        else:
+            fd = fsio.open_nofollow(part, os.O_WRONLY | os.O_APPEND)
+        with os.fdopen(fd, mode) as handle:
             while True:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled()
