@@ -35,6 +35,13 @@ Security hardening after the second marketplace review.
   username and device id in URL paths, validates rewritten feed URLs, and adds
   at most two hundred remote subscriptions per cycle.
 - An `https` link is never followed down to plain `http`.
+- After review: a fully downloaded model whose verification was interrupted
+  is hashed on the next run instead of fetched again; `opml-export` also
+  accepts the configured download folder as a root; `opml-import` never
+  blocks on a FIFO; stray converted WAVs are swept at start-up; time-limit
+  errors name ffmpeg or whisper-cli rather than `nice`; the thumbnail queue
+  in the shell issues one request per URL (a batch could record another
+  podcast's picture under the wrong URL).
 
 ## 1.0.2 — 2026-09-17
 

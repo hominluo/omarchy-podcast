@@ -501,30 +501,34 @@ Item {
   }
 
   function _pumpThumbs() {
-    while (root.connected && root._thumbInFlight < root._thumbParallel && root._thumbQueue.length > 0) {
-      var url = root._thumbQueue.shift()
-      root._thumbInFlight++
-      root.request("artwork-thumb", { url: url }, function(ok, result) {
-        root._thumbInFlight--
-        if (!ok && result && (result.code === "disconnected" || result.code === "rate-limited")) {
-          root._thumbQueue.push(url)
-          root._pumpThumbs()
-          return
-        }
-        var path = ok && result && result.path ? String(result.path) : ""
-        var thumbs = root._thumbs
-        thumbs[url] = path
-        root._thumbs = thumbs
-        var list = root._thumbWaiters[url] || []
-        var waiters = root._thumbWaiters
-        delete waiters[url]
-        root._thumbWaiters = waiters
-        for (var i = 0; i < list.length; i++) {
-          try { list[i](path) } catch (e) { console.warn("podcast: thumbnail callback failed:", e) }
-        }
+    while (root.connected && root._thumbInFlight < root._thumbParallel && root._thumbQueue.length > 0)
+      root._requestThumb(root._thumbQueue.shift())
+  }
+
+  // One request per call: `url` is this function's own, so the callback
+  // cannot see a later iteration's value.
+  function _requestThumb(url) {
+    root._thumbInFlight++
+    root.request("artwork-thumb", { url: url }, function(ok, result) {
+      root._thumbInFlight--
+      if (!ok && result && (result.code === "disconnected" || result.code === "rate-limited")) {
+        root._thumbQueue.push(url)
         root._pumpThumbs()
-      })
-    }
+        return
+      }
+      var path = ok && result && result.path ? String(result.path) : ""
+      var thumbs = root._thumbs
+      thumbs[url] = path
+      root._thumbs = thumbs
+      var list = root._thumbWaiters[url] || []
+      var waiters = root._thumbWaiters
+      delete waiters[url]
+      root._thumbWaiters = waiters
+      for (var i = 0; i < list.length; i++) {
+        try { list[i](path) } catch (e) { console.warn("podcast: thumbnail callback failed:", e) }
+      }
+      root._pumpThumbs()
+    })
   }
 
   // Failures are per daemon: a fresh one may well succeed.
