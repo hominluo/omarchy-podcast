@@ -6,6 +6,6 @@ updating the plugin folder always ends with the matching engine in charge.
 `PROTOCOL` guards the wire format between Service.qml and this package.
 """
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PROTOCOL = 1
 PLUGIN_ID = "io.github.hominluo.podcast"

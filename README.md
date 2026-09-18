@@ -229,6 +229,24 @@ longer with a smaller model. The model (a few hundred megabytes) downloads on
 first use into `~/.cache/omarchy/podcast/models/`, the transcript fills in
 paragraph by paragraph while it runs, and nothing leaves your machine.
 
+The models come from one fixed revision of
+[ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/5359861c739e955e79d9a303bcbc70fb988958b1),
+commit `5359861c739e955e79d9a303bcbc70fb988958b1`, and every download is
+checked against the size and SHA-256 recorded in `engine/transcripts/whisper.py`
+before whisper-cli is ever pointed at it:
+
+| Model | File | Size | SHA-256 |
+|---|---|---|---|
+| `large-v3-turbo` | `ggml-large-v3-turbo-q5_0.bin` | 574 041 195 | `394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2` |
+| `small` | `ggml-small-q5_1.bin` | 190 085 487 | `ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb` |
+| `base` | `ggml-base-q5_1.bin` | 59 707 625 | `422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898` |
+| `tiny` | `ggml-tiny-q5_1.bin` | 32 152 673 | `818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7` |
+
+A transfer is capped at the pinned size, resumed only when the server's byte
+range agrees with what is already on disk, and hashed in full before it is
+renamed into place; a file in the models folder that does not match — from an
+older release, or edited by hand — is deleted and fetched again.
+
 The transcription policy in settings can also run it automatically for every
 download, or for everything you add to Up Next.
 
@@ -239,7 +257,10 @@ Settings → Sync connects to [gpodder.net](https://gpodder.net) or the
 Subscriptions and playback positions are pushed after every pause and pulled on
 an interval, so AntennaPod, Kasts and friends pick up where you left off. The
 newer position wins; nothing is ever deleted from disk on the other client's
-say-so.
+say-so. The server must be reachable over `https://` — the password travels
+with every request — with plain `http://` accepted only for `localhost` (an
+SSH tunnel, say). A server that hands back hundreds of subscriptions at once
+gets them added two hundred per sync.
 
 ## Settings
 
@@ -264,7 +285,7 @@ or by hand. Keys and defaults:
 | `whisperDevice`, `whisperModel` | `auto`, `auto` | force the CPU, or a model: `large-v3-turbo`, `small`, `base` |
 | `searchProvider` | `itunes` | `itunes` (no key) or `podcastindex` |
 | `searchCountry` | `auto` | two-letter country for Apple's catalogue; `auto` follows your locale |
-| `syncProvider`, `syncServer`, `syncUsername`, `syncDeviceId`, `syncIntervalMin` | off | see [Sync](#sync); the password is entered in the Settings view |
+| `syncProvider`, `syncServer`, `syncUsername`, `syncDeviceId`, `syncIntervalMin` | off | see [Sync](#sync); `syncServer` must be `https://` (or `localhost`); the password is entered in the Settings view |
 | `showTitle`, `maxLabelWidth`, `barProgress`, `wheelAction` | `true`, `160`, `false`, `seek` | the bar cell |
 
 API keys and the sync password never go into `shell.json`; they are kept in
@@ -282,20 +303,41 @@ What it talks to: the feeds you subscribe to and their artwork hosts;
 `itunes.apple.com` (and `rss.marketingtools.apple.com`) for search and the
 charts; `api.podcastindex.org` only if you add a key;
 `huggingface.co` once per model when you first transcribe; and the sync server
-you configure. Nothing is sent anywhere otherwise.
+you configure. Nothing is sent anywhere otherwise. Only `http(s)` is ever
+fetched, an `https` link is never followed down to plain `http`, and every
+response is read under a size cap.
 
 What it runs: `mpv` (with `mpv-mpris`), `ffmpeg`, `whisper-cli`,
 `omarchy-notification-send` and `omarchy-launch-browser`. Every command is an
 argument list, never a shell string, so a hostile feed title cannot become a
-command. Feed HTML is reduced to a small safe subset before it is shown, links
-from feeds open only when you click them, and only `http(s)` URLs are ever
-fetched or played.
+command; ffmpeg and whisper-cli run in their own process groups under a time
+limit and are stopped when the daemon restarts. Feed HTML is reduced to a
+small safe subset before it is shown, links from feeds open only when you
+click them, and only `http(s)` URLs are ever played.
+
+What the shell draws: every image on screen was fetched, checked to be an
+image, and re-encoded by the daemon into a bounded JPEG under
+`~/.cache/omarchy/podcast/`. The shell process never loads a remote URL or
+decodes bytes a feed or a catalogue served — search results and previews go
+through the same pipeline into a small thumbnail cache.
+
+Who can talk to it: the daemon listens on a socket in
+`$XDG_RUNTIME_DIR/omarchy-podcast/` — a directory only you can enter — and
+checks the peer's uid on every connection. Any process running as you can
+therefore drive it: subscribe, download into the folder you configured,
+export your subscriptions somewhere under your home directory. That is the
+boundary every Omarchy plugin lives in; the daemon refuses to start at all
+without a private runtime directory (it never falls back to a shared temp
+directory), and caps what a single client can hold open or leave unread.
 
 Where it writes: `~/.local/state/omarchy/podcast/` (the library database and
-the daemon log), `~/.cache/omarchy/podcast/` (artwork, transcripts, models,
-audio fetched only to transcribe), `~/Music/Podcasts/` (downloads),
-`~/.config/omarchy/podcast/credentials.json`, and `$XDG_RUNTIME_DIR/omarchy-podcast/`
-(the sockets). It never writes inside its own plugin folder.
+the daemon log, mode 0600, with feed credentials and query strings redacted
+from logged URLs), `~/.cache/omarchy/podcast/` (artwork and thumbnails,
+transcripts, models, audio fetched only to transcribe), `~/Music/Podcasts/`
+(downloads), `~/.config/omarchy/podcast/credentials.json`, and
+`$XDG_RUNTIME_DIR/omarchy-podcast/` (the sockets). Every file is created
+under an unpredictable name and renamed into place; a link planted at a
+destination is never followed. It never writes inside its own plugin folder.
 
 ### Diagnostics
 
@@ -327,6 +369,8 @@ omarchy plugin enable io.github.hominluo.podcast --section right --before omarch
 omarchy restart shell
 ./check     # python unit tests, node tests for Model.js, qmllint, omarchy plugin validate
 ```
+
+Releases are listed in [CHANGELOG.md](CHANGELOG.md).
 
 Saving a QML file under the plugin folder hot-reloads the widgets and the
 window; `Service.qml` is kept loaded across reloads, so changes to it need

@@ -75,9 +75,12 @@ class FakeHttpServer:
                     self.end_headers()
                     return
                 status = route.get("status", 200)
+                extra = route.get("extra_headers") or {}
                 if status != 200:
                     self.send_response(status)
                     self.send_header("Content-Length", "0")
+                    for name, value in extra.items():
+                        self.send_header(name, value)
                     self.end_headers()
                     return
                 body = route["body"]
@@ -92,19 +95,26 @@ class FakeHttpServer:
                 if rng and rng.startswith("bytes=") and route.get("ranges", True):
                     start = int(rng[6:].split("-")[0])
                     self.send_response(206)
-                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, len(body) - 1, len(body)))
+                    # bad_range: claim the wrong starting offset (a broken CDN)
+                    claimed = 0 if route.get("bad_range") else start
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (claimed, len(body) - 1, len(body)))
                 else:
                     self.send_response(200)
                 chunk = body[start:]
-                if server.fail_after_bytes is not None and len(chunk) > server.fail_after_bytes:
-                    chunk = chunk[:server.fail_after_bytes]
+                if not route.get("content_length", True):
+                    self.close_connection = True      # length unknown: end with the connection
+                elif server.fail_after_bytes is not None and len(chunk) > server.fail_after_bytes:
                     self.send_header("Content-Length", str(len(body) - start))
                 else:
                     self.send_header("Content-Length", str(len(chunk)))
+                if server.fail_after_bytes is not None and len(chunk) > server.fail_after_bytes:
+                    chunk = chunk[:server.fail_after_bytes]
                 self.send_header("Content-Type", route.get("type", "application/octet-stream"))
                 if etag:
                     self.send_header("ETag", etag)
                 self.send_header("Accept-Ranges", "bytes")
+                for name, value in extra.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 if send_body:
                     try:
@@ -132,8 +142,10 @@ class FakeHttpServer:
     def url(self, path):
         return self.base + path
 
-    def add(self, path, body, content_type="application/octet-stream", etag=None, status=200, ranges=True):
-        self.routes[path] = {"body": body, "type": content_type, "etag": etag, "status": status, "ranges": ranges}
+    def add(self, path, body, content_type="application/octet-stream", etag=None, status=200, ranges=True,
+            extra_headers=None, content_length=True, bad_range=False):
+        self.routes[path] = {"body": body, "type": content_type, "etag": etag, "status": status, "ranges": ranges,
+                             "extra_headers": extra_headers, "content_length": content_length, "bad_range": bad_range}
         return self.url(path)
 
     def close(self):
@@ -160,7 +172,7 @@ class EngineHarness:
         self.paths.db_path = os.path.join(base, "t.db")
         self.paths.log_path = os.path.join(base, "t.log")
         self.paths.credentials_path = os.path.join(base, "config", "credentials.json")
-        for name in ("artwork_dir", "transcripts_dir", "chapters_dir", "audio_dir", "models_dir", "pycache_dir"):
+        for name in ("artwork_dir", "transcripts_dir", "chapters_dir", "audio_dir", "models_dir", "thumbs_dir", "pycache_dir"):
             setattr(self.paths, name, os.path.join(base, "cache", name))
         self.paths.ensure()
         self.engine = Engine(self.paths)

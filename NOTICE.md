@@ -31,8 +31,14 @@ licenses do not extend to this plugin.
 
 Transcription downloads OpenAI Whisper models converted for whisper.cpp from
 [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)
-on first use. The models are MIT licensed by OpenAI and are stored under
-`~/.cache/omarchy/podcast/models/`; they are never redistributed by this plugin.
+on first use, always from revision `5359861c739e955e79d9a303bcbc70fb988958b1`
+of that repository, and verifies each file's size and SHA-256 against the
+values recorded in `engine/transcripts/whisper.py` before it is used
+(`ggml-large-v3-turbo-q5_0.bin` `394221709c…`, `ggml-small-q5_1.bin`
+`ae85e4a935…`, `ggml-base-q5_1.bin` `422f1ae452…`, `ggml-tiny-q5_1.bin`
+`818710568d…`; the README lists them in full). The models are MIT licensed by
+OpenAI and are stored under `~/.cache/omarchy/podcast/models/`; they are
+never redistributed by this plugin.
 
 ## Catalogues
 

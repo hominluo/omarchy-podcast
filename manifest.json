@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.podcast",
   "name": "Podcast",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "Homin Luo",
   "license": "MIT",
   "homepage": "https://github.com/hominluo/Omarchy-Podcast",
@@ -248,7 +248,7 @@
           "base"
         ],
         "defaultValue": "auto",
-        "description": "auto picks large-v3-turbo on a GPU with room for it and small or base on the CPU. Models download on first use."
+        "description": "auto picks large-v3-turbo on a GPU with room for it and small or base on the CPU. Models download on first use from one pinned revision of ggerganov/whisper.cpp and are verified by SHA-256 before use."
       },
       {
         "key": "syncProvider",

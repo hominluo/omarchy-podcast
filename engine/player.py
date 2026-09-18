@@ -85,7 +85,13 @@ class MpvClient:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError:
                 pass
 
     def _close(self):

@@ -125,3 +125,42 @@ class HtmlCleanTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundsTest(unittest.TestCase):
+    def test_doctype_is_rejected(self):
+        with self.assertRaises(feeds.FeedParseError):
+            feeds.parse(b'<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY a "aaaa">]><rss version="2.0"><channel><title>&a;</title></channel></rss>', "")
+        with self.assertRaises(feeds.FeedParseError):
+            feeds.parse(b'<!-- c --> <!doctype rss><rss version="2.0"><channel><title>x</title></channel></rss>', "")
+        # A DOCTYPE quoted inside show notes is content, not a prolog.
+        parsed = feeds.parse(b'<rss version="2.0"><channel><title>ok</title><item><title>e</title><guid>g</guid>'
+                             b'<enclosure url="https://x/1.mp3" type="audio/mpeg"/>'
+                             b'<description><![CDATA[<!DOCTYPE html><p>hi</p>]]></description></item></channel></rss>', "")
+        self.assertEqual(parsed["podcast"]["title"], "ok")
+        self.assertEqual(len(parsed["episodes"]), 1)
+
+    def test_field_and_list_caps(self):
+        categories = "".join('<itunes:category text="c%d"/>' % i for i in range(60))
+        long_url = "https://x/" + "a" * 3000
+        data = ('<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
+                'xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Caps</title>'
+                '<itunes:author>%s</itunes:author><language>%s</language>%s'
+                '<item><title>e</title><guid>g</guid><enclosure url="%s" type="audio/mpeg"/>'
+                '<enclosure url="https://x/ok.mp3" type="%s"/>'
+                '%s%s</item></channel></rss>' % (
+                    "a" * 1000, "e" * 100, categories, long_url, "t" * 500,
+                    "".join('<podcast:transcript url="https://x/t%d" type="text/vtt"/>' % i for i in range(30)),
+                    "".join('<podcast:person role="%s">P%d</podcast:person>' % ("r" * 200, i) for i in range(70)),
+                )).encode()
+        parsed = feeds.parse(data, "")
+        podcast = parsed["podcast"]
+        self.assertEqual(len(podcast["author"]), feeds.MAX_SMALL)
+        self.assertEqual(len(podcast["language"]), 16)
+        self.assertEqual(len(podcast["categories"]), feeds.MAX_CATEGORIES)
+        ep = parsed["episodes"][0]
+        self.assertEqual(ep["enclosure_url"], "https://x/ok.mp3")     # the 3000-char URL was dropped
+        self.assertEqual(len(ep["enclosure_type"]), 100)
+        self.assertEqual(len(ep["transcripts"]), feeds.MAX_TRANSCRIPTS)
+        self.assertEqual(len(ep["persons"]), feeds.MAX_PERSONS)
+        self.assertEqual(len(ep["persons"][0]["role"]), 64)

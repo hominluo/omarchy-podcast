@@ -11,6 +11,7 @@ goes out as events at most twice a second per job.
 """
 
 import asyncio
+import errno
 import os
 import re
 import secrets
@@ -62,13 +63,18 @@ def safe_name(value, limit=120):
     return text.rstrip(" .") or "untitled"
 
 
+# The only extensions a library file may get. A URL ending in ".sh" or
+# ".m3u" is still audio to us or nothing; it never lands under that name.
+AUDIO_EXTENSIONS = frozenset(EXTENSIONS.values()) | frozenset(("m4b", "oga"))
+
+
 def extension_for(mime, url):
     ext = EXTENSIONS.get(str(mime or "").split(";")[0].strip().lower())
     if ext:
         return ext
     path = str(url or "").split("?")[0].split("#")[0]
     tail = path.rsplit(".", 1)
-    if len(tail) == 2 and 1 < len(tail[1]) <= 4 and tail[1].isalnum():
+    if len(tail) == 2 and tail[1].lower() in AUDIO_EXTENSIONS:
         return tail[1].lower()
     return "mp3"
 
@@ -433,8 +439,16 @@ class Downloads:
             job.bytes_total = total
             plan["etag"] = response.headers.get("ETag")
             plan["last_modified"] = response.headers.get("Last-Modified")
-            expected = total or int(plan.get("expected") or 0)
-            cap = max(expected * SIZE_SLACK, ABSOLUTE_CAP if not expected else 0) or ABSOLUTE_CAP
+            # The server's declared size bounds the transfer only up to the
+            # absolute cap; a Content-Length of 50 GB is a reason to stop,
+            # not a licence to fill the disk.
+            declared = total or 0
+            if declared > ABSOLUTE_CAP:
+                raise http.FetchError("too-large", "the file is larger than the %d MB limit" % (ABSOLUTE_CAP // (1024 * 1024)))
+            if declared > int(plan.get("expected") or 0):
+                self._check_space(path, declared)
+            expected = declared or int(plan.get("expected") or 0)
+            cap = min(expected * SIZE_SLACK, ABSOLUTE_CAP) if expected else ABSOLUTE_CAP
             last_rate_at = time.monotonic()
             last_rate_bytes = job.bytes_done
             last_progress_at = last_rate_at
@@ -482,12 +496,18 @@ class Downloads:
             return
         try:
             folder = os.path.dirname(plan["path"])
-            if os.path.exists(os.path.join(folder, "cover.jpg")):
+            cover = os.path.join(folder, "cover.jpg")
+            # Anything already at that name, link or not, is left alone; the
+            # folder must really live under the library, not merely spell it.
+            if os.path.lexists(cover):
+                return
+            root = os.path.realpath(self.engine.settings.download_dir)
+            if os.path.commonpath([os.path.realpath(folder), root]) != root:
                 return
             art = plan.get("podcast_artwork")
-            if art and os.path.exists(art) and folder.startswith(self.engine.settings.download_dir):
-                shutil.copyfile(art, os.path.join(folder, "cover.jpg"))
-        except OSError:
+            if art and os.path.isfile(art):
+                os.replace(fsio.copy_into(art, folder, ".cover-", ".jpg"), cover)
+        except (OSError, ValueError):
             pass
 
     async def _promote(self, episode_id, cache_path):
@@ -503,7 +523,16 @@ class Downloads:
 
         def move():
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.move(cache_path, target)
+            try:
+                # rename replaces whatever sits at `target` without following it
+                os.rename(cache_path, target)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                # Across filesystems: copy into a fresh file of ours, then rename.
+                tmp = fsio.copy_into(cache_path, os.path.dirname(target), ".promote-", os.path.splitext(target)[1])
+                os.replace(tmp, target)
+                os.unlink(cache_path)
 
         try:
             await self.engine.run_in_thread(move)

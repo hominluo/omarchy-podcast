@@ -11,6 +11,7 @@ before a byte is appended.
 import errno
 import os
 import secrets
+import shutil
 import stat
 
 _NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -67,6 +68,22 @@ def atomic_write(path, data, mode=0o600):
         _unlink_quiet(tmp)
         raise
     _fsync_dir(directory)
+
+
+def copy_into(src, directory, prefix, suffix="", mode=0o600):
+    """Copy `src` into an unpredictable new file in `directory` and return
+    its path, fsynced. The caller renames it into place; nothing here ever
+    opens the destination name, so a link planted there is never followed."""
+    fd, tmp = open_new(directory, prefix, suffix, mode)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as source:
+            shutil.copyfileobj(source, out, 1 << 20)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    return tmp
 
 
 def _unlink_quiet(path):

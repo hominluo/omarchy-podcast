@@ -5,7 +5,9 @@ import qs.Ui
 
 // Square cover art with a glyph standing in until the image is ready (or
 // when there is none). The daemon hands us local files it has already
-// normalised to JPEG, so `source` is a path; a bare URL also works.
+// fetched, sniffed and re-encoded to JPEG, so `source` is a path. A remote
+// URL is never loaded here: the shell process does not decode what a feed
+// or a catalogue served (RemoteArtwork asks the daemon for a thumbnail).
 //
 // Decoded at display size: a grid of 3000px PNGs decoded at full size is a
 // grid that costs hundreds of megabytes to scroll.
@@ -23,9 +25,9 @@ Item {
 
   readonly property string url: {
     var value = String(source || "")
-    if (value === "") return ""
-    if (value.indexOf("://") !== -1 || value.indexOf("data:") === 0) return value
-    return Util.fileUrl(value)
+    if (value.indexOf("file://") === 0) return value
+    if (value.charAt(0) === "/") return Util.fileUrl(value)
+    return ""
   }
   readonly property bool ready: image.status === Image.Ready && root.url !== ""
 

@@ -15,7 +15,7 @@ Three layers of configuration, kept deliberately separate:
 import json
 import os
 import socket
-import tempfile
+import stat
 
 from . import PLUGIN_ID, fsio
 
@@ -63,22 +63,46 @@ def _xdg(var, fallback):
     return os.path.join(os.path.expanduser("~"), fallback)
 
 
+def private_dir(path):
+    """True when `path` is a directory of ours that nobody else can enter:
+    not a symlink, owned by this uid, no group/other bits."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077)
+
+
+def runtime_base():
+    """The per-user runtime directory the socket may live in, or "" when
+    there is none. A shared temp directory is never a substitute: another
+    user could sit on the socket name first."""
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if value:
+        return value
+    candidate = "/run/user/%d" % os.getuid()
+    return candidate if private_dir(candidate) else ""
+
+
 class Paths:
     """Every directory and well-known file the daemon touches."""
 
     def __init__(self, plugin_dir, home=None):
         self.plugin_dir = os.path.abspath(plugin_dir)
-        runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-        self.runtime_dir = os.path.join(runtime, "omarchy-podcast")
+        base = runtime_base()
+        self.runtime_dir = os.path.join(base, "omarchy-podcast") if base else ""
         self.config_dir = os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), "omarchy", "podcast")
         self.state_dir = os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), "omarchy", "podcast")
         self.cache_dir = os.path.join(_xdg("XDG_CACHE_HOME", ".cache"), "omarchy", "podcast")
 
-        self.socket_path = os.path.join(self.runtime_dir, "daemon.sock")
-        self.lock_path = os.path.join(self.runtime_dir, "daemon.lock")
-        self.info_path = os.path.join(self.runtime_dir, "daemon.json")
-        self.mpv_socket_path = os.path.join(self.runtime_dir, "mpv.sock")
-        self.mpv_pid_path = os.path.join(self.runtime_dir, "mpv.pid")
+        # All "" when there is no runtime dir: nothing may resolve to a
+        # relative name in the current directory.
+        under = (lambda name: os.path.join(self.runtime_dir, name)) if self.runtime_dir else (lambda name: "")
+        self.socket_path = under("daemon.sock")
+        self.lock_path = under("daemon.lock")
+        self.info_path = under("daemon.json")
+        self.mpv_socket_path = under("mpv.sock")
+        self.mpv_pid_path = under("mpv.pid")
 
         self.db_path = os.path.join(self.state_dir, "podcasts.db")
         self.log_path = os.path.join(self.state_dir, "daemon.log")
@@ -90,18 +114,21 @@ class Paths:
         self.chapters_dir = os.path.join(self.cache_dir, "chapters")
         self.audio_dir = os.path.join(self.cache_dir, "audio")
         self.models_dir = os.path.join(self.cache_dir, "models")
+        self.thumbs_dir = os.path.join(self.cache_dir, "thumbs")
         self.pycache_dir = os.path.join(self.cache_dir, "pycache")
         self.skipsilence_script = os.path.join(self.plugin_dir, "mpv", "skipsilence.lua")
 
     def ensure(self):
+        if not self.runtime_dir:
+            raise RuntimeError("no private runtime directory: XDG_RUNTIME_DIR is unset and /run/user/%d is not ours" % os.getuid())
         os.makedirs(self.runtime_dir, mode=0o700, exist_ok=True)
-        try:
-            os.chmod(self.runtime_dir, 0o700)
-        except OSError:
-            pass
+        # makedirs(exist_ok=True) is happy with a symlink or a stranger's
+        # directory at that name; the daemon is not.
+        if not private_dir(self.runtime_dir):
+            raise RuntimeError("%s is not a private directory owned by this user; refusing to start" % self.runtime_dir)
         for path in (
             self.config_dir, self.state_dir, self.cache_dir, self.artwork_dir,
-            self.transcripts_dir, self.chapters_dir, self.audio_dir, self.models_dir,
+            self.transcripts_dir, self.chapters_dir, self.audio_dir, self.models_dir, self.thumbs_dir,
         ):
             os.makedirs(path, exist_ok=True)
 

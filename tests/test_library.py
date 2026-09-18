@@ -63,7 +63,10 @@ class LibraryTest(unittest.TestCase):
                 inbox = lib.inbox_page()
                 self.assertEqual(inbox["count"], 1)
                 self.assertEqual(inbox["items"][0]["title"], "Episode 2: Tags")
-                self.assertEqual(inbox["items"][0]["artwork"], "https://example.com/ep2.jpg")
+                # Remote image URLs never reach the shell; artwork is a local
+                # file once the cache job has produced one, else empty.
+                self.assertEqual(inbox["items"][0]["artwork"], "")
+                self.assertEqual(inbox["items"][0]["imageUrl"] if "imageUrl" in inbox["items"][0] else "", "")
                 self.assertTrue(inbox["items"][0]["hasTranscriptSource"])
                 # Subscribing again is idempotent.
                 again = await lib.subscribe(self.feed_url)

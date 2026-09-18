@@ -124,9 +124,15 @@ class Scheduler:
             removed = artwork.prune()
             if removed:
                 LOG.info("pruned %d unreferenced artwork file(s)", removed)
-        # Synced action rows are only history; keep three months.
-        store.execute("DELETE FROM episode_actions WHERE synced = 1 AND timestamp < ?", (int(time.time()) - 90 * 86400,))
-        store.execute("DELETE FROM subscription_changes WHERE synced = 1 AND timestamp < ?", (int(time.time()) - 90 * 86400,))
+        # Synced action rows are only history; keep three months. With sync
+        # off nothing would ever mark them synced, so the same age applies.
+        cutoff = int(time.time()) - 90 * 86400
+        store.execute("DELETE FROM episode_actions WHERE synced = 1 AND timestamp < ?", (cutoff,))
+        store.execute("DELETE FROM subscription_changes WHERE synced = 1 AND timestamp < ?", (cutoff,))
+        sync = getattr(self.engine, "sync", None)
+        if not (sync is not None and getattr(sync, "enabled", False)):
+            store.execute("DELETE FROM episode_actions WHERE timestamp < ?", (cutoff,))
+            store.execute("DELETE FROM subscription_changes WHERE timestamp < ?", (cutoff,))
         for hook in getattr(self.engine, "housekeeping_hooks", []):
             try:
                 result = hook()

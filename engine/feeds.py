@@ -28,6 +28,14 @@ MAX_ITEMS = 500
 MAX_ELEMENTS_OUTSIDE_ITEMS = 100000
 MAX_TITLE = 400
 MAX_TEXT_FIELD = 2000
+# Nothing a feed says is stored unbounded: URLs, small labels and the
+# per-item lists all have a ceiling, whatever the document declares.
+MAX_URL = 2048
+MAX_SMALL = 400
+MAX_CATEGORIES = 50
+MAX_FUNDING = 20
+MAX_TRANSCRIPTS = 20
+MAX_PERSONS = 50
 
 NS_ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 NS_PODCAST = {
@@ -167,7 +175,24 @@ def _to_epoch(value):
 
 def _http_url(value):
     text = str(value or "").strip()
-    return text if text.lower().startswith(("http://", "https://")) else ""
+    if len(text) > MAX_URL or not text.lower().startswith(("http://", "https://")):
+        return ""
+    return text
+
+
+def _small(value, limit=MAX_SMALL):
+    return str(value or "").strip()[:limit]
+
+
+_PROLOG_DOCTYPE = re.compile(rb"\A\s*(?:<\?.*?\?>\s*|<!--.*?-->\s*)*<!DOCTYPE", re.S | re.I)
+
+
+def reject_doctype(payload):
+    """Feeds never need a DTD; a document that declares one is refused
+    before the parser sees it (entity expansion is the parser's problem
+    otherwise). Only the prolog counts: show notes may quote HTML."""
+    if _PROLOG_DOCTYPE.match(bytes(payload[:65536])):
+        raise FeedParseError("the document declares a DTD, which feeds never need")
 
 
 def _int(value):
@@ -220,6 +245,7 @@ def _recover(data):
 
 def parse(data, feed_url="", max_items=MAX_ITEMS):
     payload = decode(data)
+    reject_doctype(payload)
     try:
         return _parse_bytes(payload, feed_url, max_items)
     except ET.ParseError as first:
@@ -320,15 +346,15 @@ def _parse_channel(channel, is_atom):
             for sub in elem:
                 if _kind(sub)[1] == "name":
                     child = sub
-            info["author"] = info["author"] or _text(child)
+            info["author"] = info["author"] or _small(_text(child))
         elif name == "owner" and family == "itunes" and not info["author"]:
             for sub in elem:
                 if _kind(sub)[1] == "name":
-                    info["author"] = _text(sub)
+                    info["author"] = _small(_text(sub))
         elif name == "creator" and family == "dc":
-            info["author"] = info["author"] or _text(elem)
+            info["author"] = info["author"] or _small(_text(elem))
         elif name == "language":
-            info["language"] = _text(elem).lower()
+            info["language"] = _small(_text(elem).lower(), 16)
         elif name == "image" and family == "itunes":
             info["image_url"] = _http_url(_attr(elem, "href")) or info["image_url"]
         elif name == "image" and family in ("plain", "other"):
@@ -338,18 +364,18 @@ def _parse_channel(channel, is_atom):
         elif name in ("logo", "icon") and family == "atom":
             info["image_url"] = info["image_url"] or _http_url(_text(elem))
         elif name == "guid" and family == "podcast":
-            info["podcast_guid"] = _text(elem) or None
+            info["podcast_guid"] = _small(_text(elem), 200) or None
         elif name == "funding" and family == "podcast":
             url = _http_url(_attr(elem, "url"))
-            if url:
-                info["funding"].append({"url": url, "text": _text(elem)})
+            if url and len(info["funding"]) < MAX_FUNDING:
+                info["funding"].append({"url": url, "text": _small(_text(elem))})
         elif name == "type" and family == "itunes":
-            info["itunes_type"] = _text(elem).lower()
+            info["itunes_type"] = _small(_text(elem).lower(), 32)
         elif name == "explicit" and family == "itunes":
             info["explicit"] = _explicit(_text(elem))
         elif name == "category" and family == "itunes":
-            label = _attr(elem, "text")
-            if label and label not in info["categories"]:
+            label = _small(_attr(elem, "text"), 100)
+            if label and label not in info["categories"] and len(info["categories"]) < MAX_CATEGORIES:
                 info["categories"].append(label)
     rich, text = htmlclean.clean(description or summary)
     info["description_html"] = rich
@@ -380,7 +406,7 @@ def _parse_item(item, is_atom):
             rel = _attr(elem, "rel") or "alternate"
             href = _http_url(_attr(elem, "href"))
             if rel == "enclosure" and href:
-                enclosures.append((href, _attr(elem, "type").lower(), _int(_attr(elem, "length"))))
+                enclosures.append((href, _small(_attr(elem, "type").lower(), 100), _int(_attr(elem, "length"))))
             elif rel == "alternate" and href and not ep["link"]:
                 ep["link"] = href
         elif name == "link" and family in ("plain", "other"):
@@ -390,11 +416,11 @@ def _parse_item(item, is_atom):
         elif name == "enclosure":
             url = _http_url(_attr(elem, "url"))
             if url:
-                enclosures.append((url, _attr(elem, "type").lower(), _int(_attr(elem, "length"))))
+                enclosures.append((url, _small(_attr(elem, "type").lower(), 100), _int(_attr(elem, "length"))))
         elif name == "content" and family == "media":
             url = _http_url(_attr(elem, "url"))
-            medium = _attr(elem, "medium").lower()
-            mime = _attr(elem, "type").lower()
+            medium = _small(_attr(elem, "medium").lower(), 32)
+            mime = _small(_attr(elem, "type").lower(), 100)
             if url and (mime.startswith(AUDIO_TYPES) or medium == "audio" or mime.startswith(VIDEO_TYPES) or medium == "video"):
                 enclosures.append((url, mime or ("audio/mpeg" if medium == "audio" else ""), _int(_attr(elem, "filesize"))))
         elif name == "encoded" and family == "content":
@@ -425,25 +451,25 @@ def _parse_item(item, is_atom):
             url = _http_url(_attr(elem, "url"))
             if url:
                 ep["chapters_url"] = url
-                ep["chapters_type"] = _attr(elem, "type").lower()
+                ep["chapters_type"] = _small(_attr(elem, "type").lower(), 100)
         elif name == "transcript" and family == "podcast":
             url = _http_url(_attr(elem, "url"))
-            if url:
+            if url and len(ep["transcripts"]) < MAX_TRANSCRIPTS:
                 ep["transcripts"].append({
                     "url": url,
-                    "type": _attr(elem, "type").lower(),
-                    "language": _attr(elem, "language").lower(),
-                    "rel": _attr(elem, "rel").lower(),
+                    "type": _small(_attr(elem, "type").lower(), 100),
+                    "language": _small(_attr(elem, "language").lower(), 16),
+                    "rel": _small(_attr(elem, "rel").lower(), 32),
                 })
         elif name == "person" and family == "podcast":
             person = {
                 "name": _clip(_text(elem), 200),
-                "role": _attr(elem, "role").lower() or "host",
-                "group": _attr(elem, "group").lower() or "cast",
+                "role": _small(_attr(elem, "role").lower(), 64) or "host",
+                "group": _small(_attr(elem, "group").lower(), 64) or "cast",
                 "img": _http_url(_attr(elem, "img")),
                 "href": _http_url(_attr(elem, "href")),
             }
-            if person["name"]:
+            if person["name"] and len(ep["persons"]) < MAX_PERSONS:
                 ep["persons"].append(person)
 
     chosen = _pick_enclosure(enclosures)

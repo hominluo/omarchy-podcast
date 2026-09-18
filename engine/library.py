@@ -135,7 +135,7 @@ class Library:
                 episodes.append({
                     "title": ep["title"], "pubDate": ep["pub_date"], "duration": ep["duration"],
                     "enclosureUrl": ep["enclosure_url"], "notesText": ep["notes_text"][:220],
-                    "artwork": ep["image_url"] or podcast.get("image_url", ""),
+                    "imageUrl": ep["image_url"] or podcast.get("image_url", ""),
                 })
             if len(self._previews) >= PREVIEW_CACHE_SIZE:
                 oldest = min(self._previews, key=lambda key: self._previews[key][0])

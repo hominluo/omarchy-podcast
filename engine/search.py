@@ -86,22 +86,50 @@ def canonical_feed_url(url):
     return urllib.parse.urlunsplit(("https", parts.netloc.lower(), path, parts.query, ""))
 
 
+MAX_URL = 2048
+MAX_TEXT = 400
+MAX_QUERY = 200
+
+
+def _url(value):
+    """A catalogue-supplied URL the daemon would actually fetch, else ""."""
+    text = str(value or "").strip()
+    if not text or len(text) > MAX_URL:
+        return ""
+    try:
+        return http.check_url(text)
+    except http.FetchError:
+        return ""
+
+
 def _result(title, author, feed_url, artwork, description="", episode_count=None, itunes_id=None,
             pi_id=None, last_update=None, language="", categories=None):
+    """One search result, or None when the catalogue's feed URL is not one
+    we could subscribe to. Every string is bounded; the artwork is only
+    ever a URL the daemon fetches and re-encodes itself (see artwork-thumb),
+    never something the shell loads directly."""
+    feed_url = _url(feed_url)
+    if not feed_url:
+        return None
     return {
-        "title": str(title or "").strip(),
-        "author": str(author or "").strip(),
-        "feedUrl": str(feed_url or "").strip(),
-        "artwork": str(artwork or "").strip(),
-        "description": str(description or "").strip()[:400],
-        "episodeCount": episode_count,
-        "itunesId": itunes_id,
-        "piId": pi_id,
-        "lastUpdate": last_update,
-        "language": str(language or "").lower(),
-        "categories": categories or [],
+        "title": str(title or "").strip()[:MAX_TEXT],
+        "author": str(author or "").strip()[:MAX_TEXT],
+        "feedUrl": feed_url,
+        "artwork": _url(artwork),
+        "description": str(description or "").strip()[:MAX_TEXT],
+        "episodeCount": episode_count if isinstance(episode_count, int) and not isinstance(episode_count, bool) else None,
+        "itunesId": itunes_id if isinstance(itunes_id, (int, str)) else None,
+        "piId": pi_id if isinstance(pi_id, (int, str)) else None,
+        "lastUpdate": last_update if isinstance(last_update, (int, float)) and not isinstance(last_update, bool) else None,
+        "language": str(language or "").lower()[:16],
+        "categories": [str(c)[:100] for c in (categories or [])[:10] if isinstance(c, str)],
         "subscribed": False,
     }
+
+
+def _append(results, result):
+    if result is not None:
+        results.append(result)
 
 
 class ITunesProvider:
@@ -130,12 +158,12 @@ class ITunesProvider:
             feed = item.get("feedUrl")
             if not feed:
                 continue
-            results.append(_result(
+            _append(results, _result(
                 item.get("collectionName"), item.get("artistName"), feed,
                 item.get("artworkUrl600") or item.get("artworkUrl100"), "",
                 item.get("trackCount"), item.get("collectionId"), None,
                 _iso_to_epoch(item.get("releaseDate")), "", [item["primaryGenreName"]] if item.get("primaryGenreName") else []))
-        return results
+        return results[:limit]
 
     def trending(self, lang, cat, limit):
         raise Unsupported()
@@ -168,9 +196,11 @@ class ITunesProvider:
                 item.get("collectionName") or entry["name"], item.get("artistName") or entry["artist"], item["feedUrl"],
                 item.get("artworkUrl600") or entry["artwork"], entry["summary"], item.get("trackCount"),
                 item.get("collectionId"), None, _iso_to_epoch(item.get("releaseDate")), "", genres[:3])
+            if result is None:
+                continue
             result["rank"] = rank
             results.append(result)
-        return results
+        return results[:limit]
 
     def _chart_entries(self, cc, genre, limit):
         try:
@@ -268,19 +298,23 @@ class PodcastIndexProvider:
             raise protocol.ProtocolError(protocol.NETWORK, "Podcast Index answered with something that is not JSON")
 
     @staticmethod
-    def _feeds(payload):
+    def _feeds(payload, limit=None):
         results = []
         for item in payload.get("feeds", []) or []:
+            if not isinstance(item, dict):
+                continue
             feed = item.get("url")
             if not feed:
                 continue
             categories = item.get("categories") or {}
-            results.append(_result(
+            _append(results, _result(
                 item.get("title"), item.get("author") or item.get("ownerName"), feed,
                 item.get("artwork") or item.get("image"), item.get("description"),
                 item.get("episodeCount"), item.get("itunesId"), item.get("id"),
                 item.get("newestItemPubdate") or item.get("lastUpdateTime"), item.get("language"),
                 list(categories.values()) if isinstance(categories, dict) else []))
+            if limit is not None and len(results) >= limit:
+                break
         return results
 
     def search(self, query, kind, limit, country, lang):
@@ -290,14 +324,20 @@ class PodcastIndexProvider:
             # byperson answers episodes; fold them into their feeds.
             seen = {}
             for item in payload.get("items", []) or []:
+                if not isinstance(item, dict):
+                    continue
                 feed = item.get("feedUrl")
                 if not feed or feed in seen:
                     continue
-                seen[feed] = _result(item.get("feedTitle"), item.get("feedAuthor"), feed, item.get("feedImage") or item.get("image"),
-                                     "", None, item.get("feedItunesId"), item.get("feedId"), item.get("datePublished"),
-                                     item.get("feedLanguage"), [])
+                result = _result(item.get("feedTitle"), item.get("feedAuthor"), feed, item.get("feedImage") or item.get("image"),
+                                 "", None, item.get("feedItunesId"), item.get("feedId"), item.get("datePublished"),
+                                 item.get("feedLanguage"), [])
+                if result is not None:
+                    seen[feed] = result
+                if len(seen) >= limit:
+                    break
             return list(seen.values())
-        return self._feeds(payload)
+        return self._feeds(payload, limit)
 
     def trending(self, lang, cat, limit):
         params = {"max": str(limit)}
@@ -305,7 +345,7 @@ class PodcastIndexProvider:
             params["lang"] = lang
         if cat:
             params["cat"] = cat
-        return self._feeds(self._get("podcasts/trending", params))
+        return self._feeds(self._get("podcasts/trending", params), limit)
 
     def categories(self):
         payload = self._get("categories/list", {})
@@ -406,7 +446,7 @@ class Search:
         return deduped
 
     async def search(self, query, kind="term", provider=None, country=None, lang=None, limit=25):
-        query = str(query or "").strip()
+        query = str(query or "").strip()[:MAX_QUERY]
         if len(query) < 2:
             return {"provider": "", "cached": True, "results": []}
         prov = self.provider_for(provider)

@@ -20,7 +20,7 @@ import socket
 import sys
 import time
 
-from . import PROTOCOL, VERSION, log
+from . import PROTOCOL, VERSION, fsio, log
 from .config import Paths
 
 LOCK_FD_ENV = "OMARCHY_PODCAST_LOCK_FD"
@@ -72,7 +72,11 @@ def main(argv, launcher=None):
 # ------------------------------------------------------------------ serve
 
 def run_serve(paths, launcher, foreground=False, debug=False, replace=False):
-    paths.ensure()
+    try:
+        paths.ensure()
+    except RuntimeError as error:
+        sys.stderr.write("podcastd: %s\n" % error)
+        return 1
     log.setup(paths.log_path, debug=debug, foreground=foreground)
     LOG = log.get("cli")
 
@@ -123,7 +127,9 @@ def acquire_lock(paths, replace=False):
             os.close(fd)
         except (ValueError, OSError):
             pass
-    fd = os.open(paths.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    # Our own regular file, never a link planted at the lock's name.
+    fd = fsio.open_nofollow(paths.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.set_inheritable(fd, False)
     for attempt in range(60):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

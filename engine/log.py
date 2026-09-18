@@ -17,6 +17,16 @@ def get(name):
     return logging.getLogger(ROOT + "." + name)
 
 
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """The log is created 0600 and never opened through a symlink: it
+    records feed and enclosure URLs, which private feeds key their tokens
+    into. Rotation renames, so the backups keep the mode."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 def setup(log_path, debug=False, foreground=False):
     root = logging.getLogger(ROOT)
     root.setLevel(logging.DEBUG if debug else logging.INFO)
@@ -28,7 +38,11 @@ def setup(log_path, debug=False, foreground=False):
 
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
+        try:
+            os.chmod(log_path, 0o600)          # a file an older release left world-readable
+        except OSError:
+            pass
+        file_handler = _PrivateRotatingFileHandler(
             log_path, maxBytes=_MAX_BYTES, backupCount=_BACKUPS, encoding="utf-8")
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
