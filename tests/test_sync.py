@@ -134,3 +134,75 @@ class SyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncRulesTest(unittest.TestCase):
+    def setUp(self):
+        self.http = FakeHttpServer()
+        self.feed_url = self.http.add("/feed.xml", fixture("podcasting20.xml"), "application/rss+xml")
+        self.remote = FakeGpodder(self.http)
+
+    def tearDown(self):
+        self.http.close()
+
+    def test_server_url_rules(self):
+        from engine import sync
+        self.assertEqual(sync.server_url("gpodder.net/"), "https://gpodder.net")
+        self.assertEqual(sync.server_url("https://cloud.example/nc"), "https://cloud.example/nc")
+        self.assertEqual(sync.server_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080")
+        self.assertEqual(sync.server_url("http://localhost"), "http://localhost")
+        for bad in ("http://sync.example", "http://192.168.1.5", "ftp://x", "", "https://bad host/"):
+            with self.assertRaises(sync.SyncError, msg=bad):
+                sync.server_url(bad)
+
+    def test_plain_http_is_refused_at_run(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                h.engine.apply_settings({"syncProvider": "gpodder", "syncServer": "http://sync.example",
+                                         "syncUsername": "alice", "syncDeviceId": "dev1"})
+                h.engine.credentials = {"sync": {"password": "pw"}}
+                result = await h.engine.sync.run()
+                self.assertFalse(result["synced"])
+                self.assertIn("https", result["error"])
+                self.assertEqual(self.http.requests, [])
+        run(scenario())
+
+    def test_path_segments_are_quoted(self):
+        from engine import sync
+        client = sync.Client("gpodder", self.http.base, "a/b c", "pw", "d?e")
+        self.assertEqual(client._user, "a%2Fb%20c")
+        self.assertEqual(client._device, "d%3Fe")
+
+    def test_remote_add_is_capped_and_rewrites_validated(self):
+        from unittest import mock
+        from engine import sync
+
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                h.engine.apply_settings({"syncProvider": "gpodder", "syncServer": self.http.base, "syncUsername": "alice", "syncDeviceId": "dev1"})
+                h.engine.credentials = {"sync": {"password": "pw"}}
+                await h.engine.library.subscribe(self.feed_url)
+                other = self.http.add("/other.xml", fixture("atom.xml"), "application/atom+xml")
+                third = self.http.add("/third.xml", fixture("podcasting20.xml").replace(b"Example Show", b"Third"), "application/rss+xml")
+                self.remote.remote_add = [other, third, "javascript:alert(1)"]
+                original_subs = self.remote.subs
+
+                def subs(method, params, body):
+                    reply = original_subs(method, params, body)
+                    if method == "POST":
+                        reply["update_urls"] = [[self.feed_url, "file:///etc/passwd"], [self.feed_url, self.feed_url + "?v=2"]]
+                    return reply
+                self.http.json_routes["/api/2/subscriptions/alice/dev1.json"] = subs
+                with mock.patch.object(sync, "REMOTE_ADD_LIMIT", 1):
+                    result = await h.engine.sync.run()
+                self.assertTrue(result["synced"], result)
+                titles = sorted(p["title"] for p in h.engine.library.library_list())
+                self.assertEqual(len(titles), 2, titles)                      # one remote add per cycle
+                self.assertEqual(h.engine.store.get_sync_state("last_sub_ts", 0), 0)   # not advanced: more to come
+                row = h.engine.store.one("SELECT feed_url FROM podcasts WHERE title = 'Example Show'")
+                self.assertEqual(row["feed_url"], self.feed_url + "?v=2")    # only the http(s) rewrite applied
+                with mock.patch.object(sync, "REMOTE_ADD_LIMIT", 1):
+                    result = await h.engine.sync.run()
+                self.assertEqual(len(h.engine.library.library_list()), 3)
+                self.assertEqual(h.engine.store.get_sync_state("last_sub_ts", 0), 1001)
+        run(scenario())

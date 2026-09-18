@@ -40,9 +40,10 @@ def _get(row, key, default=None):
 
 
 def artwork_for(row):
-    """Local artwork wins; a remote URL is a workable fallback the shell can
-    load directly (except WebP, which the cache job converts later)."""
-    for key in ("artwork_path", "image_url", "podcast_artwork_path", "podcast_image_url"):
+    """The local, daemon-produced artwork file for a row, else "". Remote
+    URLs never reach the shell: until the cache job has fetched and
+    re-encoded an image, the view shows its placeholder glyph."""
+    for key in ("artwork_path", "podcast_artwork_path"):
         value = _get(row, key, "")
         if value:
             return value
@@ -135,7 +136,7 @@ def podcast_summary(row):
         "id": _get(row, "id"),
         "title": _get(row, "title", ""),
         "author": _get(row, "author", ""),
-        "artwork": _get(row, "artwork_path", "") or _get(row, "image_url", ""),
+        "artwork": _get(row, "artwork_path", ""),
         "feedUrl": _get(row, "feed_url", ""),
         "link": _get(row, "link", ""),
         "language": _get(row, "language", ""),

@@ -32,7 +32,8 @@ Item {
   readonly property int podcastId: podcast && podcast.podcastId ? Number(podcast.podcastId) : (show && show.podcastId ? Number(show.podcastId) : 0)
   readonly property string title: podcast && podcast.title ? String(podcast.title) : (show ? String(show.title || show.feedUrl || "") : "")
   readonly property string author: podcast && podcast.author ? String(podcast.author) : (show ? String(show.author || "") : "")
-  readonly property string artwork: podcast && podcast.image_url ? String(podcast.image_url) : (show ? String(show.artwork || "") : "")
+  // A remote URL: the daemon turns it into a local thumbnail (RemoteArtwork).
+  readonly property string artworkUrl: podcast && podcast.image_url ? String(podcast.image_url) : (show ? String(show.artwork || "") : "")
   readonly property string description: {
     if (podcast && podcast.description_text) return String(podcast.description_text)
     return show ? String(show.description || "") : ""
@@ -155,9 +156,10 @@ Item {
       width: parent.width
       spacing: Style.space(12)
 
-      Artwork {
+      RemoteArtwork {
         size: Style.space(84)
-        source: root.artwork
+        service: root.service
+        remoteUrl: root.artworkUrl
         foreground: root.foreground
         Layout.alignment: Qt.AlignTop
       }

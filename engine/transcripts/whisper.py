@@ -3,7 +3,9 @@
 Arch ships `whisper-cpp` (the `whisper-cli` binary) and, separately, the
 `ggml-vulkan` backend that ggml loads at runtime when present — on this
 class of machine that is the difference between real time and twenty times
-faster. Models are downloaded on first use into the cache.
+faster. Models are downloaded on first use into the cache from one pinned
+revision of ggerganov/whisper.cpp and verified against a SHA-256 recorded
+here before whisper-cli ever opens them.
 
 The runner is deliberately plain: convert the audio to 16 kHz mono WAV with
 ffmpeg, run whisper-cli over it in ten-minute chunks under nice/ionice, and
@@ -12,12 +14,18 @@ in while the rest is still being worked out. Everything here blocks; the
 manager drives it from a thread.
 """
 
+import collections
 import glob
+import hashlib
 import json
 import os
+import re
 import shutil
+import signal
+import stat
 import subprocess
 import tempfile
+import threading
 import time
 
 from .. import fsio, http, log
@@ -25,15 +33,27 @@ from .canonical import segment
 
 LOG = log.get("whisper")
 
-MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+Model = collections.namedtuple("Model", "file size sha256 gpu")
+
+# One immutable revision of https://huggingface.co/ggerganov/whisper.cpp; the
+# sizes and digests are the LFS objects at that commit. Bump all three
+# together, never the URL alone.
+MODEL_REVISION = "5359861c739e955e79d9a303bcbc70fb988958b1"
+MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/"
 MODELS = {
-    # name: (file, approx bytes, needs GPU to be pleasant)
-    "large-v3-turbo": ("ggml-large-v3-turbo-q5_0.bin", 574041195, True),
-    "small": ("ggml-small-q5_1.bin", 190085487, False),
-    "base": ("ggml-base-q5_1.bin", 59707625, False),
-    "tiny": ("ggml-tiny-q5_1.bin", 32166155, False),
+    "large-v3-turbo": Model("ggml-large-v3-turbo-q5_0.bin", 574041195,
+                            "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2", True),
+    "small": Model("ggml-small-q5_1.bin", 190085487,
+                   "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb", False),
+    "base": Model("ggml-base-q5_1.bin", 59707625,
+                  "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898", False),
+    "tiny": Model("ggml-tiny-q5_1.bin", 32152673,
+                  "818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7", False),
 }
-GGML_MAGIC = (b"lmgg", b"ggml", b"GGUF", b"tjgg", b"lmgg")
+MODEL_STALL_SECONDS = 90
+MODEL_TOTAL_DEADLINE = 2 * 3600
+MODEL_SPACE_SLACK = 1.1
+HASH_CHUNK = 1 << 20
 CHUNK_SECONDS = 600
 OVERLAP_SECONDS = 4
 VRAM_FOR_TURBO = 1.5 * 1024 ** 3
@@ -86,8 +106,8 @@ def detect(models_dir, settings=None):
         model = "small"
     else:
         model = "base"
-    model_file = MODELS[model][0]
-    present = os.path.exists(os.path.join(models_dir, model_file))
+    entry = MODELS[model]
+    present = _size_matches(os.path.join(models_dir, entry.file), entry.size)
     return {
         "available": binary is not None,
         "binary": binary or "",
@@ -96,7 +116,7 @@ def detect(models_dir, settings=None):
         "vram": vram,
         "cpus": cpus,
         "model": model,
-        "modelFile": model_file,
+        "modelFile": entry.file,
         "modelPresent": present,
         "ffmpeg": shutil.which("ffmpeg") is not None,
     }
@@ -116,72 +136,283 @@ def estimate_seconds(duration, info):
 # ---------------------------------------------------------------- models
 
 def model_path(models_dir, model):
-    return os.path.join(models_dir, MODELS[model][0])
+    return os.path.join(models_dir, MODELS[model].file)
 
 
-def model_ok(path, model):
+def model_url(entry):
+    return MODEL_BASE_URL + MODEL_REVISION + "/" + entry.file
+
+
+def _size_matches(path, size):
     try:
-        size = os.path.getsize(path)
+        return os.stat(path).st_size == size
     except OSError:
         return False
-    expected = MODELS[model][1]
-    if size < expected * 0.9:
+
+
+def _sha256_fd(handle, cancel=None):
+    digest = hashlib.sha256()
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        block = handle.read(HASH_CHUNK)
+        if not block:
+            return digest.hexdigest()
+        digest.update(block)
+
+
+def verify_model(path, entry, cancel=None):
+    """True when `path` is our own regular file of exactly the pinned size
+    and SHA-256. Blocking: about a second per 500 MB on an SSD."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
         return False
-    with open(path, "rb") as handle:
-        magic = handle.read(4)
-    return magic in GGML_MAGIC
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != entry.size:
+            return False
+        return _sha256_fd(handle, cancel) == entry.sha256
+
+
+class _Restart(Exception):
+    """The server's answer does not fit the partial file: start over."""
+
+
+class _Discard(Exception):
+    """The transfer can never complete correctly: drop the partial file."""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _check_space(directory, size):
+    try:
+        usage = shutil.disk_usage(directory)
+    except OSError:
+        return
+    if usage.free < int(size * MODEL_SPACE_SLACK):
+        raise TranscribeError("not enough free space for the model (%d MB left, %d MB needed)"
+                              % (usage.free // (1024 * 1024), size // (1024 * 1024)))
+
+
+def _probe(url, entry):
+    """Fail before the transfer when the server already says the object is
+    not the one pinned here. Hugging Face exposes the LFS size and digest on
+    its redirect; a host that does not is simply not pre-checked."""
+    headers = http.probe_headers(url)
+    etag = str(headers.get("x-linked-etag") or "").strip().strip('"').lower()
+    size = str(headers.get("x-linked-size") or "").strip()
+    if (etag and etag != entry.sha256) or (size.isdigit() and int(size) != entry.size):
+        raise TranscribeError("the model on the server no longer matches the pinned digest; not downloading")
+
+
+def _sidecar_path(target):
+    return target + ".download.json"
+
+
+def _read_sidecar(models_dir, entry, sidecar):
+    """The recorded temp name of an unfinished download, if it still fits
+    the pinned table; anything else is forgotten."""
+    try:
+        with open(sidecar, "rb") as handle:
+            data = json.loads(handle.read(4096))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    temp = str(data.get("temp") or "")
+    pattern = re.escape(entry.file) + r"\.[0-9a-f]{16}\.part"
+    if (data.get("size") != entry.size or data.get("sha256") != entry.sha256
+            or data.get("revision") != MODEL_REVISION or not re.fullmatch(pattern, temp)):
+        return None
+    return os.path.join(models_dir, temp)
+
+
+def _sweep_orphans(models_dir, entry, keep):
+    """Drop partial files of this model that no valid sidecar claims."""
+    pattern = re.escape(entry.file) + r"\.[0-9a-f]{16}\.part"
+    try:
+        names = os.listdir(models_dir)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(models_dir, name)
+        if re.fullmatch(pattern, name) and path != keep:
+            _unlink_quiet(path)
+
+
+def _open_resume(models_dir, entry, sidecar):
+    temp = _read_sidecar(models_dir, entry, sidecar)
+    _sweep_orphans(models_dir, entry, temp)
+    if temp is None:
+        _unlink_quiet(sidecar)
+        return None
+    try:
+        fd = fsio.open_nofollow(temp, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        _unlink_quiet(sidecar)
+        return None
+    info = os.fstat(fd)
+    if info.st_nlink != 1 or not 0 < info.st_size < entry.size:
+        os.close(fd)
+        _unlink_quiet(temp)
+        _unlink_quiet(sidecar)
+        return None
+    return fd, temp, info.st_size
+
+
+def _open_fresh(models_dir, entry, sidecar):
+    fd, temp = fsio.open_new(models_dir, entry.file + ".", ".part")
+    fsio.atomic_write(sidecar, json.dumps({
+        "temp": os.path.basename(temp), "size": entry.size, "sha256": entry.sha256, "revision": MODEL_REVISION,
+    }))
+    return fd, temp, 0
+
+
+def _content_range(value):
+    """('bytes S-E/T') -> (S, T); (None, None) when absent or malformed."""
+    match = re.fullmatch(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*", str(value or ""))
+    if not match:
+        return None, None
+    start, _end, total = match.groups()
+    return int(start), (int(total) if total != "*" else None)
+
+
+def _int_header(value):
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else None
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
 
 
 def download_model(models_dir, model, progress=None, cancel=None):
-    """Blocking, resumable download of a model file. `progress(done, total)`
-    is called at most every half second."""
-    file_name, expected, _ = MODELS[model]
-    target = os.path.join(models_dir, file_name)
-    if model_ok(target, model):
+    """Blocking, resumable download of a model file, verified against the
+    pinned size and SHA-256 before it is installed. `progress(done, total,
+    phase)` is called at most every half second; phases are "downloading",
+    "verifying" and "done". Raises TranscribeError, Cancelled or
+    http.FetchError (the latter leaves a resumable partial file behind)."""
+    entry = MODELS[model]
+    target = model_path(models_dir, model)
+    sidecar = _sidecar_path(target)
+    url = model_url(entry)
+    if verify_model(target, entry, cancel):
         return target
+    # A file of the wrong size or digest is never kept, whoever put it there.
+    _unlink_quiet(target)
     os.makedirs(models_dir, exist_ok=True)
-    part = target + ".part"
-    done = os.path.getsize(part) if os.path.exists(part) else 0
-    headers = {"Range": "bytes=%d-" % done} if done else {}
-    response = http.open_stream(MODEL_BASE_URL + file_name, timeout=60, headers=headers)
-    try:
-        status = getattr(response, "status", 200)
-        mode = "ab" if status == 206 else "wb"
-        if mode == "wb":
-            done = 0
-        total_header = response.headers.get("Content-Length")
-        total = (done + int(total_header)) if total_header and total_header.isdigit() and mode == "ab" else (int(total_header) if total_header and total_header.isdigit() else expected)
-        last = 0.0
-        if mode == "wb":
-            try:
-                os.unlink(part)
-            except FileNotFoundError:
-                pass
-            fd = fsio.open_nofollow(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        else:
-            fd = fsio.open_nofollow(part, os.O_WRONLY | os.O_APPEND)
-        with os.fdopen(fd, mode) as handle:
+    _unlink_quiet(target + ".part")      # the predictable temp older releases used
+    _check_space(models_dir, entry.size)
+    _probe(url, entry)
+    for _attempt in range(2):
+        resumed = _open_resume(models_dir, entry, sidecar)
+        fd, temp, done = resumed or _open_fresh(models_dir, entry, sidecar)
+        response = None
+        try:
+            headers = {"Range": "bytes=%d-" % done} if done else None
+            response = http.open_stream(url, timeout=60, headers=headers)
+            status = getattr(response, "status", 200)
+            if done and status == 206:
+                start, total = _content_range(response.headers.get("Content-Range"))
+                if start != done or total != entry.size:
+                    raise _Restart()
+            elif status == 200:
+                if done:
+                    # The server ignored the range: reuse the temp from byte 0.
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    done = 0
+            else:
+                raise http.FetchError("http", "server answered %d" % status, status=status)
+            length = _int_header(response.headers.get("Content-Length"))
+            if length is not None and length != entry.size - done:
+                kind = "too-large" if length > entry.size - done else "http"
+                raise _Discard(kind, "the server offers %d bytes but the pinned model is %d" % (length + done, entry.size))
+            started = time.monotonic()
+            last_progress = rate_at = alive_at = started
+            rate_bytes = done
             while True:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled()
                 chunk = http.read_chunk(response)
                 if not chunk:
                     break
-                handle.write(chunk)
                 done += len(chunk)
+                if done > entry.size:
+                    raise _Discard("too-large", "the server sent more than the pinned model size")
+                _write_all(fd, chunk)
                 now = time.monotonic()
-                if progress and now - last > 0.5:
-                    last = now
-                    progress(done, total)
-    finally:
-        response.close()
-    os.replace(part, target)
-    if not model_ok(target, model):
-        os.unlink(target)
-        raise TranscribeError("the downloaded model file looks wrong; try again")
-    if progress:
-        progress(total, total)
-    return target
+                if now - started > MODEL_TOTAL_DEADLINE:
+                    raise http.FetchError("network", "the model download took more than two hours")
+                if now - rate_at >= 1.0:
+                    rate = (done - rate_bytes) / (now - rate_at)
+                    rate_at, rate_bytes = now, done
+                    if rate >= 256:
+                        alive_at = now
+                    elif now - alive_at > MODEL_STALL_SECONDS:
+                        raise http.FetchError("network", "the server stopped sending")
+                if progress and now - last_progress > 0.5:
+                    last_progress = now
+                    progress(done, entry.size, "downloading")
+            if done != entry.size:
+                raise http.FetchError("network", "connection dropped at %d of %d bytes" % (done, entry.size))
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            if progress:
+                progress(entry.size, entry.size, "verifying")
+            with open(temp, "rb") as handle:
+                digest = _sha256_fd(handle, cancel)
+            if digest != entry.sha256:
+                raise _Discard("integrity", "the downloaded model failed its integrity check")
+            os.replace(temp, target)
+            _unlink_quiet(sidecar)
+            fsio._fsync_dir(models_dir)
+            if progress:
+                progress(entry.size, entry.size, "done")
+            return target
+        except _Restart:
+            _close_quiet(fd)
+            _unlink_quiet(temp)
+            _unlink_quiet(sidecar)
+            continue
+        except _Discard as error:
+            _close_quiet(fd)
+            _unlink_quiet(temp)
+            _unlink_quiet(sidecar)
+            if error.kind == "integrity":
+                raise TranscribeError(error.message)
+            raise http.FetchError(error.kind, error.message)
+        except BaseException:
+            # Network errors and cancellation keep the partial file for a resume.
+            _close_quiet(fd)
+            raise
+        finally:
+            if response is not None:
+                response.close()
+    raise TranscribeError("the server's copy of the model keeps changing; try again later")
+
+
+def _close_quiet(fd):
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- pipeline
@@ -195,7 +426,52 @@ def _nice(argv):
     return prefix + argv
 
 
-def convert_to_wav(source, wav_path, cancel=None):
+_CHILDREN = set()
+_CHILDREN_LOCK = threading.Lock()
+
+
+def _run(argv, errlog, cancel, deadline_seconds):
+    """Run a tool in its own process group, registered so a restart can
+    reap it, and wait for it under a cancel flag and a wall-clock limit."""
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog,
+                               start_new_session=True, close_fds=True)
+    with _CHILDREN_LOCK:
+        _CHILDREN.add(process)
+    try:
+        _wait(process, cancel, time.monotonic() + deadline_seconds)
+    finally:
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(process)
+    return process
+
+
+def _kill_group(process):
+    # start_new_session makes the child its own group leader (pgid == pid),
+    # so this also reaches anything nice/ionice or the tool itself forked.
+    for sig, grace in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def kill_children():
+    """Stop every ffmpeg/whisper-cli this process started; called before the
+    daemon re-executes itself so nothing keeps running under the new image."""
+    with _CHILDREN_LOCK:
+        procs = list(_CHILDREN)
+    for process in procs:
+        _kill_group(process)
+
+
+def convert_to_wav(source, wav_path, cancel=None, deadline_seconds=3600):
     """ffmpeg -> 16 kHz mono s16le WAV, the only input whisper.cpp wants.
     Returns the duration in seconds."""
     argv = _nice(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", source, "-vn", "-ac", "1", "-ar", "16000",
@@ -203,8 +479,7 @@ def convert_to_wav(source, wav_path, cancel=None):
     # stderr goes to a file, never a pipe: _wait does not drain, and a damaged
     # file makes ffmpeg print one line per bad frame.
     with tempfile.TemporaryFile(prefix="ffmpeg-stderr-") as errlog:
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
-        _wait(process, cancel)
+        process = _run(argv, errlog, cancel, deadline_seconds)
         if process.returncode != 0:
             errlog.seek(0)
             err = errlog.read()[-4096:].decode("utf-8", "replace").strip()
@@ -216,23 +491,24 @@ def convert_to_wav(source, wav_path, cancel=None):
     return max(0.0, (size - 44) / 32000.0)
 
 
-def _wait(process, cancel):
+def _wait(process, cancel, deadline):
     # Polls; never hand the child a PIPE, nothing here drains it.
     while True:
         try:
             process.wait(timeout=0.25)
             return
         except subprocess.TimeoutExpired:
-            if cancel is not None and cancel.is_set():
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                raise Cancelled()
+            pass
+        if cancel is not None and cancel.is_set():
+            _kill_group(process)
+            raise Cancelled()
+        if time.monotonic() > deadline:
+            _kill_group(process)
+            raise TranscribeError("%s ran past its time limit and was stopped" % os.path.basename(str(process.args[0])))
 
 
-def transcribe_chunk(binary, model_file, wav_path, offset_seconds, duration_seconds, language, gpu, threads, cancel=None):
+def transcribe_chunk(binary, model_file, wav_path, offset_seconds, duration_seconds, language, gpu, threads,
+                     cancel=None, deadline_seconds=1800):
     """One whisper-cli run over [offset, offset+duration]. Returns
     (segments in absolute seconds, detected language)."""
     with tempfile.TemporaryDirectory(prefix="whisper-") as tmp:
@@ -243,8 +519,7 @@ def transcribe_chunk(binary, model_file, wav_path, offset_seconds, duration_seco
         if not gpu:
             argv.append("-ng")
         with open(os.path.join(tmp, "stderr"), "w+b") as errlog:
-            process = subprocess.Popen(_nice(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
-            _wait(process, cancel)
+            process = _run(_nice(argv), errlog, cancel, deadline_seconds)
             if process.returncode != 0:
                 errlog.seek(0)
                 err = errlog.read()[-4096:].decode("utf-8", "replace").strip()

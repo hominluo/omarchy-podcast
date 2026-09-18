@@ -26,15 +26,14 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "io.github.hominluo.podcast"
   readonly property string pluginVersion: manifest && manifest.version ? String(manifest.version) : ""
-  // Mirrors engine/config.py: XDG_RUNTIME_DIR, else the same temp dir Python
-  // would pick.
+  // Mirrors engine/config.py: the socket lives in the private per-user
+  // runtime directory and nowhere else. Without one the daemon refuses to
+  // start, and so does this side (a world-shared temp dir is never used).
   readonly property string runtimeDir: {
     var dir = Quickshell.env("XDG_RUNTIME_DIR")
-    if (dir && dir !== "") return dir
-    var tmp = Quickshell.env("TMPDIR") || Quickshell.env("TEMP") || Quickshell.env("TMP")
-    return tmp && tmp !== "" ? tmp.replace(/\/+$/, "") : "/tmp"
+    return dir && dir !== "" ? dir.replace(/\/+$/, "") : ""
   }
-  readonly property string socketPath: runtimeDir + "/omarchy-podcast/daemon.sock"
+  readonly property string socketPath: runtimeDir !== "" ? runtimeDir + "/omarchy-podcast/daemon.sock" : ""
   readonly property string launcherPath: decodeURIComponent(String(Qt.resolvedUrl("podcastd.py")).replace(/^file:\/\//, ""))
 
   // ---- state mirrored from the daemon ------------------------------------
@@ -222,6 +221,7 @@ Item {
             root._lastPong = Date.now()
             root.pushSettings(true)
             root._flush()
+            root._pumpThumbs()
           }
           root._pending = handshake
           handshakeTimer.restart()
@@ -249,6 +249,7 @@ Item {
     handshakeTimer.stop()
     var wasConnected = root.connection === "connected"
     root.connection = "connecting"
+    root._forgetFailedThumbs()
     // Callers waiting on an answer hear about the loss instead of hanging,
     // and stale fire-and-forget requests do not replay on the next daemon.
     var pending = root._pending
@@ -275,6 +276,11 @@ Item {
   }
 
   function _connect() {
+    if (root.socketPath === "") {
+      if (root.connection !== "unavailable") console.warn("podcast: XDG_RUNTIME_DIR is not set; the daemon needs a private runtime directory")
+      root.connection = "unavailable"
+      return
+    }
     if (root._socket && root._socket.connected) return
     root._disposeSocket()
     attemptTimer.restart()                       // before the attempt: it may fail synchronously
@@ -320,7 +326,14 @@ Item {
     }
   }
 
-  Component.onCompleted: reconnectTimer.start()
+  Component.onCompleted: {
+    if (root.socketPath === "") {
+      console.warn("podcast: XDG_RUNTIME_DIR is not set; the daemon needs a private runtime directory")
+      root.connection = "unavailable"
+      return
+    }
+    reconnectTimer.start()
+  }
 
   // ---- settings ----------------------------------------------------------
   function _entryFromBarConfig() {
@@ -464,6 +477,62 @@ Item {
   function trending(options, callback) { root.request("trending", options || {}, callback) }
   function charts(options, callback) { root.request("charts", options || {}, callback) }
   function genres(callback) { root.request("genres", {}, callback) }
+
+  // ---- thumbnails --------------------------------------------------------
+  // Remote images (search results, previews) are never loaded by the shell;
+  // the daemon fetches and re-encodes them and answers with a local path.
+  // A small queue keeps a fifty-tile chart from flooding the socket.
+  property var _thumbs: ({})          // url -> local path ("" = failed this session)
+  property var _thumbWaiters: ({})    // url -> [callback]
+  property var _thumbQueue: []
+  property int _thumbInFlight: 0
+  readonly property int _thumbParallel: 6
+
+  function thumbnail(url, callback) {
+    url = String(url || "")
+    if (url === "" || url.length > 2048 || !/^https?:\/\//i.test(url)) { callback(""); return }
+    if (root._thumbs[url] !== undefined) { callback(root._thumbs[url]); return }
+    var waiters = root._thumbWaiters
+    if (waiters[url]) { waiters[url].push(callback); return }
+    waiters[url] = [callback]
+    root._thumbWaiters = waiters
+    root._thumbQueue.push(url)
+    root._pumpThumbs()
+  }
+
+  function _pumpThumbs() {
+    while (root.connected && root._thumbInFlight < root._thumbParallel && root._thumbQueue.length > 0) {
+      var url = root._thumbQueue.shift()
+      root._thumbInFlight++
+      root.request("artwork-thumb", { url: url }, function(ok, result) {
+        root._thumbInFlight--
+        if (!ok && result && (result.code === "disconnected" || result.code === "rate-limited")) {
+          root._thumbQueue.push(url)
+          root._pumpThumbs()
+          return
+        }
+        var path = ok && result && result.path ? String(result.path) : ""
+        var thumbs = root._thumbs
+        thumbs[url] = path
+        root._thumbs = thumbs
+        var list = root._thumbWaiters[url] || []
+        var waiters = root._thumbWaiters
+        delete waiters[url]
+        root._thumbWaiters = waiters
+        for (var i = 0; i < list.length; i++) {
+          try { list[i](path) } catch (e) { console.warn("podcast: thumbnail callback failed:", e) }
+        }
+        root._pumpThumbs()
+      })
+    }
+  }
+
+  // Failures are per daemon: a fresh one may well succeed.
+  function _forgetFailedThumbs() {
+    var kept = {}
+    for (var url in root._thumbs) if (root._thumbs[url] !== "") kept[url] = root._thumbs[url]
+    root._thumbs = kept
+  }
 
   // What the Browse view was showing, so coming back lands on the same
   // chart with the same region (the view is rebuilt on every visit).

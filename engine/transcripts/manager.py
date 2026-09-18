@@ -14,7 +14,7 @@ import os
 import sqlite3
 import threading
 
-from .. import http, log, protocol
+from .. import fsio, http, log, protocol
 from ..store import now
 from . import canonical, parsers, whisper
 
@@ -32,6 +32,7 @@ class Transcripts:
         self._cancel = None
         self._task = None
         self._model_tasks = {}        # model -> (task, stop event); one download per model, shared
+        self._model_failures = {}     # model -> consecutive integrity failures
         self._forgotten = None        # running job whose transcript was deleted meanwhile
 
     # ---- lifecycle ---------------------------------------------------------
@@ -39,7 +40,7 @@ class Transcripts:
     async def start(self):
         self.store = self.engine.store
         self._detect()
-        self.engine.on_settings_changed(self._detect)
+        self.engine.on_settings_changed(self._on_settings)
         self.engine.on_download_done = self._on_download_done
         self.engine.on_queued = self._on_queued
         # A run interrupted by a restart is queued again and redone from the start.
@@ -62,6 +63,13 @@ class Transcripts:
                 await self._task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # _wait() already stopped the running tool when the cancel flag went
+        # up; this catches anything that slipped past before a re-exec.
+        whisper.kill_children()
+
+    def _on_settings(self):
+        self._model_failures.clear()
+        self._detect()
 
     def _detect(self):
         self.info = whisper.detect(self.engine.paths.models_dir, self.engine.settings)
@@ -286,12 +294,16 @@ class Transcripts:
         payload.update(extra)
         self.engine.emit("transcript-progress", payload)
 
-    async def _ensure_model(self, cancel=None):
-        """The model file for the current setting, downloading it once. Two
-        callers (a job and the settings button) share one download."""
-        model = self.info["model"]
+    async def _ensure_model(self, cancel=None, model=None):
+        """The model file for the current setting (or `model`), downloading
+        it once. Two callers (a job and the settings button) share one
+        download."""
+        model = model or self.info["model"]
         path = whisper.model_path(self.engine.paths.models_dir, model)
-        if whisper.model_ok(path, model):
+        if self._model_failures.get(model, 0) >= 2:
+            raise whisper.TranscribeError("the %s model failed its integrity check twice; change the model setting or restart to try again" % model)
+        # A full SHA-256 of the file, once per job, never on the loop thread.
+        if await self.engine.run_in_thread(whisper.verify_model, path, whisper.MODELS[model]):
             return path
         entry = self._model_tasks.get(model)
         if entry is None or entry[0].done():
@@ -306,13 +318,25 @@ class Transcripts:
         return task.result()
 
     async def _download_model(self, model, cancel):
-        def progress(done, total):
-            self.engine.call_soon(lambda d=done, t=total: self.engine.update_state(
-                "jobs", modelDownload={"model": model, "percent": int(100 * d / max(1, t)), "done": d, "total": t}))
+        def progress(done, total, phase="downloading"):
+            self.engine.call_soon(lambda d=done, t=total, p=phase: self.engine.update_state(
+                "jobs", modelDownload={"model": model, "percent": int(100 * d / max(1, t)), "done": d, "total": t, "phase": p}))
 
-        self.engine.notice("info", "Downloading the %s speech model (%d MB) — first time only" % (model, whisper.MODELS[model][1] // (1024 * 1024)))
+        self.engine.notice("info", "Downloading the %s speech model (%d MB) — first time only" % (model, whisper.MODELS[model].size // (1024 * 1024)))
         try:
-            path = await self.engine.run_in_thread(whisper.download_model, self.engine.paths.models_dir, model, progress, cancel)
+            for attempt in (1, 2):
+                try:
+                    path = await self.engine.run_in_thread(whisper.download_model, self.engine.paths.models_dir, model, progress, cancel)
+                except whisper.TranscribeError as error:
+                    if "integrity" not in str(error):
+                        raise
+                    self._model_failures[model] = self._model_failures.get(model, 0) + 1
+                    LOG.warning("model %s failed verification (attempt %d): %s", model, attempt, error)
+                    if attempt == 2 or self._model_failures[model] >= 2:
+                        raise
+                    continue
+                self._model_failures.pop(model, None)
+                break
         except http.FetchError as error:
             raise whisper.TranscribeError("could not download the model: %s" % error.message)
         finally:
@@ -351,10 +375,29 @@ class Transcripts:
         if self._cancel.is_set():
             raise whisper.Cancelled()
 
-        wav = os.path.join(self.engine.paths.audio_dir, "%d.wav" % episode_id)
+        # An unpredictable, freshly created file of ours; ffmpeg's -y then
+        # reopens that exact name rather than a guessable one.
+        fd, wav = fsio.open_new(self.engine.paths.audio_dir, "%d." % episode_id, ".wav")
+        os.close(fd)
         self._progress(episode_id, "converting", 0, [])
-        duration = await self.engine.run_heavy(whisper.convert_to_wav, audio, wav, self._cancel)
+        try:
+            known = float(row["duration"] or 0)
+        except (TypeError, ValueError):
+            known = 0.0
+        convert_deadline = max(60.0, 10.0 * known) if known > 0 else 3600.0
+        try:
+            duration = await self.engine.run_heavy(whisper.convert_to_wav, audio, wav, self._cancel, convert_deadline)
+        except BaseException:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
+            raise
         if duration <= 0:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
             raise whisper.TranscribeError("the audio is empty")
 
         doc_path = self._doc_path(row)
@@ -370,20 +413,26 @@ class Transcripts:
             for offset, length in whisper.plan_chunks(duration):
                 if self._cancel.is_set():
                     raise whisper.Cancelled()
+                # CPU large-v3-turbo needs ~33 min for a ten-minute chunk;
+                # twelve times the chunk still bounds a wedged process.
+                chunk_deadline = max(1800.0, 12.0 * length)
                 try:
                     chunk, detected = await self.engine.run_heavy(
-                        whisper.transcribe_chunk, self.info["binary"], model_path, wav, offset, length, language, gpu, threads, self._cancel)
+                        whisper.transcribe_chunk, self.info["binary"], model_path, wav, offset, length, language, gpu, threads,
+                        self._cancel, chunk_deadline)
                 except whisper.TranscribeError as error:
                     if gpu:
                         LOG.warning("GPU run failed (%s); retrying this chunk on the CPU", error)
                         gpu = False
                         chunk, detected = await self.engine.run_heavy(
-                            whisper.transcribe_chunk, self.info["binary"], model_path, wav, offset, length, language, gpu, threads, self._cancel)
+                            whisper.transcribe_chunk, self.info["binary"], model_path, wav, offset, length, language, gpu, threads,
+                            self._cancel, chunk_deadline)
                     else:
                         raise
                 if self._cancel.is_set():
                     raise whisper.Cancelled()
-                if language == "auto" and detected:
+                detected = whisper.normalize_language(detected)
+                if language == "auto" and detected != "auto":
                     language = detected
                     doc["language"] = detected
                 before = len(segments)
@@ -461,13 +510,13 @@ def cmd_transcript_delete(engine, client, episodeId):
     return engine.transcripts.delete(episodeId)
 
 
-@protocol.command("whisper-download-model", "Fetch a speech model ahead of time", model=A(str, required=False))
+@protocol.command("whisper-download-model", "Fetch a speech model ahead of time",
+                  model=A(str, required=False, choices=sorted(whisper.MODELS)))
 async def cmd_whisper_download_model(engine, client, model):
     transcripts = engine.transcripts
-    if model and model in whisper.MODELS:
-        transcripts.info["model"] = model
+    chosen = model or transcripts.info["model"]
     try:
-        path = await transcripts._ensure_model()
+        path = await transcripts._ensure_model(model=chosen)
     except whisper.TranscribeError as error:
         raise protocol.ProtocolError(protocol.NETWORK, str(error))
-    return {"model": transcripts.info["model"], "path": path}
+    return {"model": chosen, "path": path}

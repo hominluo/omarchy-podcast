@@ -1,14 +1,14 @@
 """HTTP fetching with the guard rails a feed reader needs.
 
 urllib only. Every fetch is bounded (timeout, byte cap, redirect count), only
-http(s) is ever followed, gzip is handled whether or not the server said so,
-and conditional requests (ETag / Last-Modified) turn an unchanged feed into a
-cheap 304. Blocking by design: callers run it in a worker thread.
+http(s) is ever followed and an https link is never followed down to plain
+http, gzip is handled whether or not the server said so, and conditional
+requests (ETag / Last-Modified) turn an unchanged feed into a cheap 304.
+Blocking by design: callers run it in a worker thread.
 """
 
 import http.client
 import io
-import os
 import socket
 import ssl
 import time
@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-from . import VERSION, fsio, log
+from . import VERSION, log
 
 LOG = log.get("http")
 
@@ -82,20 +82,23 @@ class Response:
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
-    """Follow a few redirects, only to http(s), and never carry credentials
-    to another host or down to plain http."""
+    """Follow a few redirects, only to http(s), never from https down to
+    plain http, and never carry credentials to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urlsplit(newurl)
         scheme = target.scheme.lower()
         if scheme not in ("http", "https"):
             raise FetchError("bad-url", "redirect to unsupported scheme %r" % scheme, status=code)
+        # req.full_url is this hop's URL, so a chain that goes https -> https
+        # -> http is caught at the hop that downgrades.
+        origin = urllib.parse.urlsplit(req.full_url)
+        if origin.scheme.lower() == "https" and scheme == "http":
+            raise FetchError("bad-url", "the server redirected from https to plain http; refusing", status=code)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
-        origin = urllib.parse.urlsplit(req.full_url)
-        crosses = target.netloc.lower() != origin.netloc.lower() or (origin.scheme == "https" and scheme == "http")
-        if crosses:
+        if target.netloc.lower() != origin.netloc.lower():
             for name in list(new.headers.keys()):
                 if name.lower() in SENSITIVE_HEADERS:
                     del new.headers[name]
@@ -118,6 +121,8 @@ def check_url(url):
         raise FetchError("bad-url", "that is not a valid link: %s" % error)
     if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
         raise FetchError("bad-url", "only http and https links can be fetched")
+    if any(ch.isspace() for ch in parts.netloc) or not (parts.hostname or ""):
+        raise FetchError("bad-url", "the link has no valid host")
     try:
         parts.port  # raises for a malformed port
     except ValueError:
@@ -282,35 +287,47 @@ def read_chunk(response):
         raise FetchError("network", "the connection dropped: %s" % _short(error))
 
 
-def download_to_file(url, path, cap, timeout=DEFAULT_TIMEOUT, headers=None):
-    """Stream a bounded body straight to `path` (via a temp file next to it).
-    Returns the Response with an empty body but the real headers."""
-    response = open_stream(url, timeout=timeout, headers=headers)
-    total = 0
-    fd, tmp = fsio.open_new(_dirname(path), ".dl.")
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so the *first* hop's headers come back (as the
+    HTTPError urllib raises for an unhandled 3xx)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def probe_headers(url, timeout=20):
+    """HEAD `url` and return the first hop's headers without following a
+    redirect. Hugging Face, for one, puts the pinned object's size and
+    digest on the 302 that sends a client to its CDN; the final response
+    no longer carries them."""
+    url = check_url(url)
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
     try:
-        with os.fdopen(fd, "wb") as handle:
-            started = time.monotonic()
-            while True:
-                chunk = read_chunk(response)
-                if not chunk:
-                    break
-                if time.monotonic() - started > TOTAL_DEADLINE:
-                    raise FetchError("network", "the server is too slow")
-                total += len(chunk)
-                if total > cap:
-                    raise FetchError("too-large", "the file is larger than %d MB" % (cap // (1024 * 1024)))
-                handle.write(chunk)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    finally:
-        response.close()
-    return Response(response.geturl(), response.status, response.headers, b"")
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+            return response.headers
+    except urllib.error.HTTPError as error:
+        if 300 <= error.code < 400:
+            return error.headers
+        raise FetchError("http", _http_message(error), status=error.code)
+    except ssl.SSLError as error:
+        raise FetchError("tls", "secure connection failed: %s" % _short(error))
+    except NETWORK_ERRORS as error:
+        reason = getattr(error, "reason", error)
+        raise FetchError("network", "could not reach the server: %s" % _short(reason))
+
+
+def redact_url(url):
+    """A URL fit for a log line: scheme, host and path only. Private feeds
+    carry their token in the query string or as userinfo."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return "<unparseable url>"
+    host = parts.hostname or ""
+    if parts.port:
+        host = "%s:%d" % (host, parts.port)
+    text = urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+    return text + "?\u2026" if parts.query else text
 
 
 def _charset(content_type):

@@ -121,3 +121,195 @@ class WhisperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelDownloadTest(unittest.TestCase):
+    """download_model against a fake Hugging Face: pinned size + SHA-256."""
+
+    BODY = bytes(range(256)) * 800     # 204800 bytes
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+        from unittest import mock
+        from tests.fakes import FakeHttpServer
+        self.http = FakeHttpServer()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.models_dir = os.path.join(self.tmp.name, "models")
+        self.entry = whisper.Model("ggml-tiny-q5_1.bin", len(self.BODY), hashlib.sha256(self.BODY).hexdigest(), False)
+        patches = [
+            mock.patch.dict(whisper.MODELS, {"tiny": self.entry}),
+            mock.patch.object(whisper, "MODEL_BASE_URL", self.http.base + "/"),
+            mock.patch.object(whisper, "MODEL_REVISION", "rev"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.http.close)
+        self.phases = []
+
+    def progress(self, done, total, phase="downloading"):
+        self.phases.append(phase)
+
+    def target(self):
+        return os.path.join(self.models_dir, self.entry.file)
+
+    def leftovers(self):
+        try:
+            return sorted(name for name in os.listdir(self.models_dir) if name != self.entry.file)
+        except FileNotFoundError:
+            return []
+
+    def gets(self):
+        return [req for req in self.http.requests if req[0] == "GET"]
+
+    def test_good_download_installs_and_verifies(self):
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertEqual(path, self.target())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), self.BODY)
+        self.assertEqual(self.leftovers(), [])
+        self.assertIn("verifying", self.phases)
+        self.assertEqual(self.phases[-1], "done")
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        # A second call is satisfied by the verified file: no new request.
+        before = len(self.http.requests)
+        whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertEqual(len(self.http.requests), before)
+
+    def test_bad_digest_is_rejected(self):
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY[:-1] + b"\x00")
+        with self.assertRaises(whisper.TranscribeError) as caught:
+            whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertIn("integrity", str(caught.exception))
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_resume_after_drop(self):
+        from engine import http
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY)
+        self.http.fail_after_bytes = 60000
+        with self.assertRaises(http.FetchError):
+            whisper.download_model(self.models_dir, "tiny", self.progress)
+        left = self.leftovers()
+        self.assertEqual(len(left), 2, left)             # the .part and its sidecar
+        self.assertTrue(any(name.endswith(".part") for name in left))
+        self.assertTrue(any(name.endswith(".download.json") for name in left))
+        self.http.fail_after_bytes = None
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.leftovers(), [])
+        second = self.gets()[-1]
+        self.assertEqual(second[2].get("Range"), "bytes=60000-")
+
+    def test_declared_size_mismatch_is_refused(self):
+        from engine import http
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY + b"extra")
+        with self.assertRaises(http.FetchError) as caught:
+            whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertEqual(caught.exception.kind, "too-large")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_oversized_body_without_length_is_capped(self):
+        from engine import http
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY + b"extra", content_length=False)
+        with self.assertRaises(http.FetchError) as caught:
+            whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertEqual(caught.exception.kind, "too-large")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_stale_sidecar_is_ignored(self):
+        os.makedirs(self.models_dir)
+        stale = os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.0123456789abcdef.part")
+        with open(stale, "wb") as handle:
+            handle.write(b"x" * 10)
+        with open(os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.download.json"), "w") as handle:
+            json.dump({"temp": os.path.basename(stale), "size": self.entry.size, "sha256": "0" * 64, "revision": "rev"}, handle)
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.leftovers(), [])
+        self.assertNotIn("Range", self.gets()[0][2])
+
+    def _plant_partial(self):
+        os.makedirs(self.models_dir)
+        temp = os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.0123456789abcdef.part")
+        with open(temp, "wb") as handle:
+            handle.write(self.BODY[:10])
+        with open(os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.download.json"), "w") as handle:
+            json.dump({"temp": os.path.basename(temp), "size": self.entry.size, "sha256": self.entry.sha256, "revision": "rev"}, handle)
+
+    def test_ignored_range_restarts_from_zero(self):
+        self._plant_partial()
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY, ranges=False)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.gets()[0][2].get("Range"), "bytes=10-")
+
+    def test_wrong_content_range_restarts(self):
+        self._plant_partial()
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY, bad_range=True)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.leftovers(), [])
+        # first attempt asked for a resume, the retry started fresh
+        ranges = [req[2].get("Range") for req in self.gets()]
+        self.assertEqual(ranges, ["bytes=10-", None])
+
+    def test_probe_mismatch_fails_before_transfer(self):
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY, extra_headers={"x-linked-etag": '"' + "0" * 64 + '"'})
+        with self.assertRaises(whisper.TranscribeError) as caught:
+            whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertIn("pinned digest", str(caught.exception))
+        self.assertEqual([req[0] for req in self.http.requests], ["HEAD"])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_corrupt_existing_model_is_replaced(self):
+        os.makedirs(self.models_dir)
+        with open(self.target(), "wb") as handle:
+            handle.write(b"junk" * 100)
+        with open(self.target() + ".part", "wb") as handle:
+            handle.write(b"old predictable temp")
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_verify_model_and_detect(self):
+        os.makedirs(self.models_dir)
+        with open(self.target(), "wb") as handle:
+            handle.write(self.BODY)
+        self.assertTrue(whisper.verify_model(self.target(), self.entry))
+        with open(self.target(), "r+b") as handle:
+            handle.seek(5)
+            handle.write(b"\xff")
+        self.assertFalse(whisper.verify_model(self.target(), self.entry))      # right size, wrong bytes
+        link = os.path.join(self.models_dir, "link.bin")
+        os.symlink(self.target(), link)
+        self.assertFalse(whisper.verify_model(link, self.entry))              # never through a symlink
+        with open(self.target(), "ab") as handle:
+            handle.write(b"x")
+        self.assertFalse(whisper.verify_model(self.target(), self.entry))      # wrong size
+        info = whisper.detect(self.models_dir)
+        self.assertEqual(sorted(info.keys()), ["available", "binary", "cpus", "ffmpeg", "gpu", "model", "modelFile",
+                                               "modelPresent", "vram", "vulkan"])
+
+    def test_cancel_and_deadline_kill_the_process_group(self):
+        import subprocess
+        import tempfile
+        import threading
+        import time
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+        with tempfile.TemporaryFile() as errlog:
+            with self.assertRaises(whisper.Cancelled):
+                whisper._run(["sh", "-c", "sleep 60 & sleep 60"], errlog, cancel, 30)
+        with tempfile.TemporaryFile() as errlog:
+            started = time.monotonic()
+            with self.assertRaises(whisper.TranscribeError) as caught:
+                whisper._run(["sh", "-c", "sleep 60"], errlog, None, 0.5)
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertIn("time limit", str(caught.exception))
+        self.assertEqual(whisper._CHILDREN, set())

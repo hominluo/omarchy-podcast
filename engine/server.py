@@ -11,12 +11,29 @@ import asyncio
 import json
 import math
 import os
+import socket
 import stat
+import struct
 
 from . import PROTOCOL, VERSION, log
 from . import protocol
 
 LOG = log.get("server")
+
+# The socket sits in a 0700 directory and is itself 0600, so only this user
+# reaches it; the peer credential check below makes that explicit rather
+# than inherited from directory permissions. Everything else bounds what one
+# client may cost the daemon.
+MAX_CLIENTS = 16
+MAX_INFLIGHT = 32
+WRITE_HIGH_WATER = 4 * 1024 * 1024
+
+
+def _peer_uid(writer):
+    """The uid at the other end of a unix socket (SO_PEERCRED)."""
+    sock = writer.get_extra_info("socket")
+    _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    return uid
 
 
 class Client:
@@ -37,6 +54,15 @@ class Client:
 
     def send(self, payload):
         if self.closed:
+            return
+        # A client that stops reading must not grow our buffer without bound.
+        try:
+            backlog = self.writer.transport.get_write_buffer_size()
+        except (AttributeError, RuntimeError):
+            backlog = 0
+        if backlog > WRITE_HIGH_WATER:
+            LOG.warning("%r is not reading (%d bytes queued); dropping it", self, backlog)
+            self.close()
             return
         try:
             self.writer.write((encode(payload) + "\n").encode("utf-8"))
@@ -72,6 +98,15 @@ class Client:
 
     def __repr__(self):
         return "Client(%d, %s)" % (self.number, self.name or "?")
+
+
+def _request_id(line):
+    """The id of a request we are about to refuse, parsed only then."""
+    try:
+        message = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return message.get("id") if isinstance(message, dict) else None
 
 
 def encode(payload):
@@ -151,6 +186,17 @@ class Server:
     # ---- connection handling -----------------------------------------------
 
     async def _on_connect(self, reader, writer):
+        try:
+            uid = _peer_uid(writer)
+        except (OSError, AttributeError, struct.error, TypeError):
+            uid = None                                  # fail closed
+        if uid != os.geteuid() or len(self.clients) >= MAX_CLIENTS:
+            LOG.warning("refusing connection: peer uid %s, %d clients connected", uid, len(self.clients))
+            try:
+                writer.close()
+            except (OSError, RuntimeError):
+                pass
+            return
         client = Client(self, reader, writer)
         self.clients.add(client)
         LOG.debug("%r connected", client)
@@ -185,6 +231,11 @@ class Server:
                 # The handshake is sequential; everything after it may overlap
                 # so a slow subscribe does not hold up a pause.
                 await self._handle_line(client, line)
+                await client.drain()
+                continue
+            if len(client.tasks) >= MAX_INFLIGHT:
+                client.fail(_request_id(line), protocol.ProtocolError(
+                    protocol.RATE_LIMITED, "too many requests in flight (%d)" % MAX_INFLIGHT))
                 await client.drain()
                 continue
             task = asyncio.ensure_future(self._request(client, line))

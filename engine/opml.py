@@ -1,11 +1,12 @@
 """OPML import and export: the interchange format every podcast app speaks."""
 
 import os
+import stat
 import time
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import quoteattr
 
-from . import fsio, log, protocol
+from . import feeds, fsio, log, protocol
 
 LOG = log.get("opml")
 A = protocol.Arg
@@ -13,6 +14,7 @@ A = protocol.Arg
 
 def parse(data):
     """Feed URLs (with titles) from an OPML document, in document order."""
+    feeds.reject_doctype(data)
     try:
         root = ET.fromstring(data)
     except ET.ParseError as error:
@@ -55,13 +57,21 @@ def render(podcasts):
     return "\n".join(lines)
 
 
+MAX_IMPORT_BYTES = 20 * 1024 * 1024
+
+
 async def import_file(engine, path):
     path = os.path.expanduser(str(path or "").strip())
     try:
-        with open(path, "rb") as handle:
-            data = handle.read(20 * 1024 * 1024)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOCTTY)
     except OSError as error:
         raise protocol.ProtocolError(protocol.NOT_FOUND, "cannot read %s: %s" % (path, error.strerror))
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise protocol.ProtocolError(protocol.BAD_REQUEST, "%s is not a regular file" % path)
+        data = handle.read(MAX_IMPORT_BYTES + 1)
+    if len(data) > MAX_IMPORT_BYTES:
+        raise protocol.ProtocolError(protocol.BAD_REQUEST, "%s is larger than %d MB" % (path, MAX_IMPORT_BYTES // (1024 * 1024)))
     entries = parse(data)
     added, skipped, failed = [], [], []
     for entry in entries:
@@ -78,12 +88,24 @@ async def import_file(engine, path):
 
 
 def export_file(engine, path=None):
+    """Write the subscriptions somewhere under the user's home. The path is
+    the client's choice, so it is confined: any process running as this
+    user can talk to the daemon, and an export must not become a way to
+    overwrite an arbitrary file or to write through a planted link."""
     if not path:
         path = os.path.join(engine.settings.download_dir, "subscriptions.opml")
     path = os.path.expanduser(str(path))
+    if os.path.islink(path):
+        raise protocol.ProtocolError(protocol.BAD_REQUEST, "refusing to write through a symlink")
+    home = os.path.realpath(os.path.expanduser("~"))
+    folder = os.path.realpath(os.path.dirname(path) or ".")
+    if folder != home and not folder.startswith(home + os.sep):
+        raise protocol.ProtocolError(protocol.BAD_REQUEST, "the export path must be inside your home directory (%s)" % home)
+    target = os.path.join(folder, os.path.basename(path))
     podcasts = engine.library.library_list()
-    fsio.atomic_write(path, render(podcasts), mode=0o644)
-    return {"path": path, "count": len(podcasts)}
+    # 0600: subscription lists carry private-feed tokens.
+    fsio.atomic_write(target, render(podcasts), mode=0o600)
+    return {"path": target, "count": len(podcasts)}
 
 
 @protocol.command("opml-import", "Subscribe to every feed in an OPML file", path=A(str))

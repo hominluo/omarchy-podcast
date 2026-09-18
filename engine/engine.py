@@ -142,6 +142,11 @@ class Engine:
         # The new process must not restart again for the same plugin version
         # (a manifest bumped without engine/__init__.py would loop forever).
         os.environ[RESTARTED_FOR_ENV] = self._restart_for or ""
+        # Nothing this image started may keep running under the next one: a
+        # requeued transcription would otherwise race an orphaned ffmpeg for
+        # the same output file.
+        from .transcripts import whisper
+        whisper.kill_children()
         LOG.info("re-executing: %s", " ".join(argv))
         os.execv(sys.executable, argv)
 

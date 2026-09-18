@@ -80,3 +80,38 @@ class CredentialsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeDirTest(unittest.TestCase):
+    def test_runtime_dir_must_be_private(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = config.Paths(PLUGIN_DIR)
+            for name in ("config_dir", "state_dir", "cache_dir", "artwork_dir", "transcripts_dir", "chapters_dir",
+                         "audio_dir", "models_dir", "thumbs_dir"):
+                setattr(paths, name, os.path.join(tmp, "x", name))
+            shared = os.path.join(tmp, "shared")
+            os.makedirs(shared, mode=0o755)
+            paths.runtime_dir = shared
+            with self.assertRaises(RuntimeError):
+                paths.ensure()
+            os.symlink(shared, os.path.join(tmp, "link"))
+            paths.runtime_dir = os.path.join(tmp, "link")
+            with self.assertRaises(RuntimeError):
+                paths.ensure()
+            paths.runtime_dir = os.path.join(tmp, "fresh")
+            paths.ensure()
+            self.assertEqual(oct(os.stat(paths.runtime_dir).st_mode & 0o777), "0o700")
+            paths.runtime_dir = ""
+            with self.assertRaises(RuntimeError):
+                paths.ensure()
+
+    def test_no_shared_temp_fallback(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}), mock.patch.object(config, "private_dir", return_value=False):
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            paths = config.Paths(PLUGIN_DIR)
+            self.assertEqual(paths.runtime_dir, "")
+            self.assertEqual(paths.socket_path, "")
+            with self.assertRaises(RuntimeError):
+                paths.ensure()

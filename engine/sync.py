@@ -27,6 +27,31 @@ A = protocol.Arg
 BATCH = 500
 DEBOUNCE_SECONDS = 30
 PLAYED_MARGIN = 30
+# A server may hand back any number of subscriptions to add; each one is a
+# feed fetch. This many per cycle, the rest on the next (the server resends
+# them because last_sub_ts only advances once the list is drained).
+REMOTE_ADD_LIMIT = 200
+MAX_FEED_URL = 2048
+LOOPBACK = ("localhost", "127.0.0.1", "::1")
+
+
+def server_url(raw):
+    """The sync server as a validated https URL. Basic auth travels with
+    every request, so plain http is refused unless the server is this
+    machine (an SSH tunnel, a local test instance)."""
+    text = str(raw or "").strip().rstrip("/")
+    if not text:
+        raise SyncError("no sync server is configured")
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        url = http.check_url(text)
+    except http.FetchError as error:
+        raise SyncError("the sync server address is not a valid URL: %s" % error.message)
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" and (parts.hostname or "").lower() not in LOOPBACK:
+        raise SyncError("the sync server must be https:// (plain http is only allowed for localhost)")
+    return url.rstrip("/")
 
 
 class SyncError(Exception):
@@ -59,12 +84,13 @@ class Client:
 
     def __init__(self, provider, server, username, password, device_id):
         self.provider = provider
-        self.server = server.rstrip("/")
-        if not self.server.startswith(("http://", "https://")):
-            self.server = "https://" + self.server
+        self.server = server_url(server)
         self.username = username
         self.password = password
         self.device_id = device_id
+        # Both land in URL paths; a "/" or "?" in either must not change the endpoint.
+        self._user = urllib.parse.quote(str(username), safe="")
+        self._device = urllib.parse.quote(str(device_id), safe="")
         if provider == "nextcloud":
             self.base = self.server + "/index.php/apps/gpoddersync"
         else:
@@ -106,7 +132,7 @@ class Client:
     def register_device(self, caption):
         if self.provider == "nextcloud":
             return
-        self._call("POST", "/api/2/devices/%s/%s.json" % (self.username, self.device_id), body={"caption": caption, "type": "desktop"})
+        self._call("POST", "/api/2/devices/%s/%s.json" % (self._user, self._device), body={"caption": caption, "type": "desktop"})
 
     # ---- subscriptions -----------------------------------------------------
 
@@ -114,24 +140,24 @@ class Client:
         body = {"add": list(add), "remove": list(remove)}
         if self.provider == "nextcloud":
             return self._call("POST", "/subscription_change/create", body=body)
-        return self._call("POST", "/api/2/subscriptions/%s/%s.json" % (self.username, self.device_id), body=body)
+        return self._call("POST", "/api/2/subscriptions/%s/%s.json" % (self._user, self._device), body=body)
 
     def pull_subscriptions(self, since):
         if self.provider == "nextcloud":
             return self._call("GET", "/subscriptions", params={"since": int(since)})
-        return self._call("GET", "/api/2/subscriptions/%s/%s.json" % (self.username, self.device_id), params={"since": int(since)})
+        return self._call("GET", "/api/2/subscriptions/%s/%s.json" % (self._user, self._device), params={"since": int(since)})
 
     # ---- episode actions ---------------------------------------------------
 
     def push_actions(self, actions):
         if self.provider == "nextcloud":
             return self._call("POST", "/episode_action/create", body=actions)
-        return self._call("POST", "/api/2/episodes/%s.json" % self.username, body=actions)
+        return self._call("POST", "/api/2/episodes/%s.json" % self._user, body=actions)
 
     def pull_actions(self, since):
         if self.provider == "nextcloud":
             return self._call("GET", "/episode_action", params={"since": int(since)})
-        return self._call("GET", "/api/2/episodes/%s.json" % self.username, params={"since": int(since), "aggregated": "true"})
+        return self._call("GET", "/api/2/episodes/%s.json" % self._user, params={"since": int(since), "aggregated": "true"})
 
 
 class Sync:
@@ -225,8 +251,8 @@ class Sync:
             return {"synced": False, "reason": "not configured" if not self.enabled else "already running"}
         self._running = True
         self._broadcast()
-        client = self._client()
         try:
+            client = self._client()
             if not self.store.get_sync_state("device_registered", False):
                 await self.engine.run_in_thread(client.register_device, "Omarchy-Podcast (%s)" % client.device_id)
                 self.store.set_sync_state("device_registered", True)
@@ -268,10 +294,14 @@ class Sync:
             for pair in (result or {}).get("update_urls", []) or []:
                 if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str) and isinstance(pair[1], str)):
                     continue
-                if pair[0] == pair[1] or not pair[1].lower().startswith(("http://", "https://")):
+                if pair[0] == pair[1] or len(pair[1]) > MAX_FEED_URL:
                     continue
                 try:
-                    self.store.execute("UPDATE podcasts SET feed_url = ? WHERE feed_url = ?", (pair[1][:2000], pair[0]))
+                    new_url = http.check_url(pair[1])
+                except http.FetchError:
+                    continue
+                try:
+                    self.store.execute("UPDATE podcasts SET feed_url = ? WHERE feed_url = ?", (new_url, pair[0]))
                 except sqlite3.IntegrityError:
                     LOG.warning("sync: server rewrote %s to %s, which is already subscribed", pair[0], pair[1])
         since = int(self.store.get_sync_state("last_sub_ts", 0) or 0)
@@ -283,9 +313,21 @@ class Sync:
         known = {canonical_feed_url(r["feed_url"]): r for r in self.store.all("SELECT id, feed_url, subscribed_at FROM podcasts")}
         local_removed = {canonical_feed_url(r["feed_url"]) for r in self.store.all(
             "SELECT feed_url FROM subscription_changes WHERE action = 'remove' AND timestamp >= ?", (since,))}
+        additions = []
         for url in (remote or {}).get("add", []) or []:
+            if not isinstance(url, str) or len(url) > MAX_FEED_URL:
+                continue
+            try:
+                additions.append(http.check_url(url))
+            except http.FetchError as error:
+                LOG.warning("sync: ignoring subscription %r: %s", url[:80], error.message)
+        deferred = 0
+        for url in additions:
             key = canonical_feed_url(url)
             if key in known or key in local_removed:
+                continue
+            if len(touched) >= REMOTE_ADD_LIMIT:
+                deferred += 1
                 continue
             touched.add(key)
             try:
@@ -309,6 +351,10 @@ class Sync:
         for row in self.store.all("SELECT id, feed_url FROM subscription_changes WHERE synced = 0 AND id > ?", (mark_from,)):
             if canonical_feed_url(row["feed_url"]) in touched:
                 self.store.execute("UPDATE subscription_changes SET synced = 1 WHERE id = ?", (row["id"],))
+        if deferred:
+            LOG.info("sync: %d more subscription(s) will be added on the next cycle", deferred)
+            self.engine.notice("info", "Sync added %d podcasts; %d more follow on the next sync" % (len(touched), deferred), code="sync")
+            return    # last_sub_ts stays put so the server sends the rest again
         stamp = (remote or {}).get("timestamp")
         self.store.set_sync_state("last_sub_ts", int(stamp) if isinstance(stamp, (int, float)) else now())
 

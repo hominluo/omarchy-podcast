@@ -641,10 +641,11 @@ Item {
                   width: Style.space(112)
                   height: Style.space(112)
 
-                  Artwork {
+                  RemoteArtwork {
                     anchors.fill: parent
                     size: Style.space(112)
-                    source: String(modelData.artwork || "")
+                    service: root.service
+                    remoteUrl: String(modelData.artwork || "")
                     foreground: browser.foreground
                     glyphSize: Style.space(40)
                   }

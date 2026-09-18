@@ -38,6 +38,10 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(extension_for("audio/x-m4a", ""), "m4a")
         self.assertEqual(extension_for("", "https://x/y/file.OGG?x=1"), "ogg")
         self.assertEqual(extension_for("application/octet-stream", "https://x/y/noext"), "mp3")
+        # Only audio extensions ever reach the library; anything else is "mp3".
+        self.assertEqual(extension_for("", "https://x/y/run.sh"), "mp3")
+        self.assertEqual(extension_for("", "https://x/y/list.M3U"), "mp3")
+        self.assertEqual(extension_for("", "https://x/y/book.m4b"), "m4b")
 
 
 class DownloadTest(unittest.TestCase):
@@ -134,3 +138,88 @@ class DownloadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownloadBoundsTest(unittest.TestCase):
+    def setUp(self):
+        self.http = FakeHttpServer()
+        self.audio = bytes(range(256)) * 4000  # 1 MB
+        body = fixture("podcasting20.xml").replace(b"https://cdn.example.com/ep2.mp3", self.http.url("/ep2.mp3").encode())
+        self.feed_url = self.http.add("/feed.xml", body, "application/rss+xml")
+
+    def tearDown(self):
+        self.http.close()
+
+    async def _failed_row(self, h, ep_id):
+        for _ in range(400):
+            row = h.engine.store.one("SELECT status, error, temp_path FROM downloads WHERE episode_id = ?", (ep_id,))
+            if row is not None and row["status"] in ("queued", "failed") and row["error"]:
+                return row
+            await asyncio.sleep(0.05)
+        self.fail("download never failed")
+
+    def test_declared_size_over_cap_is_refused(self):
+        from unittest import mock
+        from engine import downloads
+        self.http.add("/ep2.mp3", self.audio, "audio/mpeg")
+
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                h.engine.settings.update({"downloadDir": os.path.join(h.tmp.name, "music")})
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                ep = h.engine.library.episodes_page(podcast["id"])["items"][0]
+                with mock.patch.object(downloads, "ABSOLUTE_CAP", 500 * 1024):
+                    h.engine.downloads.request([ep["id"]])
+                    row = await self._failed_row(h, ep["id"])
+                self.assertIn("larger than", row["error"])
+                self.assertFalse(row["temp_path"] and os.path.exists(row["temp_path"]) and os.path.getsize(row["temp_path"]))
+                self.assertEqual([r for r in self.http.requests if r[1] == "/ep2.mp3"][0][0], "GET")
+        run(scenario())
+
+    def test_body_without_length_is_capped(self):
+        from unittest import mock
+        from engine import downloads
+        self.http.add("/ep2.mp3", self.audio, "audio/mpeg", content_length=False)
+
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                h.engine.settings.update({"downloadDir": os.path.join(h.tmp.name, "music")})
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                ep = h.engine.library.episodes_page(podcast["id"])["items"][0]
+                with mock.patch.object(downloads, "ABSOLUTE_CAP", 300 * 1024), mock.patch.object(downloads, "SIZE_SLACK", 1):
+                    h.engine.downloads.request([ep["id"]])
+                    row = await self._failed_row(h, ep["id"])
+                self.assertIn("larger", row["error"])
+                if row["temp_path"] and os.path.exists(row["temp_path"]):
+                    self.assertLessEqual(os.path.getsize(row["temp_path"]), 300 * 1024 + downloads.CHUNK)
+        run(scenario())
+
+    def test_cover_and_promote_never_follow_links(self):
+        self.http.add("/ep2.mp3", self.audio, "audio/mpeg")
+
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                music = os.path.join(h.tmp.name, "music")
+                h.engine.settings.update({"downloadDir": music})
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                ep = h.engine.library.episodes_page(podcast["id"])["items"][0]
+                # Give the podcast some artwork so a cover would be written.
+                art = os.path.join(h.tmp.name, "art.jpg")
+                with open(art, "wb") as handle:
+                    handle.write(b"\xff\xd8\xff" + b"a" * 100)
+                h.engine.store.execute("UPDATE podcasts SET artwork_path = ? WHERE id = ?", (art, podcast["id"]))
+                # Plant a symlink where cover.jpg would go.
+                victim = os.path.join(h.tmp.name, "victim")
+                with open(victim, "wb") as handle:
+                    handle.write(b"keep me")
+                folder = os.path.join(music, "Example Show")
+                os.makedirs(folder, exist_ok=True)
+                os.symlink(victim, os.path.join(folder, "cover.jpg"))
+                h.engine.downloads.request([ep["id"]], keep=1)
+                path = await asyncio.wait_for(h.engine.downloads.wait_for(ep["id"]), 20)
+                self.assertTrue(path and os.path.isfile(path))
+                self.assertEqual(os.path.dirname(path), folder)
+                with open(victim, "rb") as handle:
+                    self.assertEqual(handle.read(), b"keep me")
+                self.assertTrue(os.path.islink(os.path.join(folder, "cover.jpg")))
+        run(scenario())
