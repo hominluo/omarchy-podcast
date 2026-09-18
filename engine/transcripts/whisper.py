@@ -263,7 +263,10 @@ def _open_resume(models_dir, entry, sidecar):
         _unlink_quiet(sidecar)
         return None
     info = os.fstat(fd)
-    if info.st_nlink != 1 or not 0 < info.st_size < entry.size:
+    # A temp of exactly the pinned size was downloaded in full and only
+    # missed its verification (a stop during the hash): it goes straight
+    # to the hash again rather than being fetched anew.
+    if info.st_nlink != 1 or not 0 < info.st_size <= entry.size:
         os.close(fd)
         _unlink_quiet(temp)
         _unlink_quiet(sidecar)
@@ -323,10 +326,13 @@ def download_model(models_dir, model, progress=None, cancel=None):
         fd, temp, done = resumed or _open_fresh(models_dir, entry, sidecar)
         response = None
         try:
-            headers = {"Range": "bytes=%d-" % done} if done else None
-            response = http.open_stream(url, timeout=60, headers=headers)
-            status = getattr(response, "status", 200)
-            if done and status == 206:
+            if done < entry.size:
+                headers = {"Range": "bytes=%d-" % done} if done else None
+                response = http.open_stream(url, timeout=60, headers=headers)
+            status = getattr(response, "status", 200) if response is not None else 200
+            if response is None:
+                pass                                  # nothing left to transfer: verify what is there
+            elif done and status == 206:
                 start, total = _content_range(response.headers.get("Content-Range"))
                 if start != done or total != entry.size:
                     raise _Restart()
@@ -338,14 +344,14 @@ def download_model(models_dir, model, progress=None, cancel=None):
                     done = 0
             else:
                 raise http.FetchError("http", "server answered %d" % status, status=status)
-            length = _int_header(response.headers.get("Content-Length"))
+            length = _int_header(response.headers.get("Content-Length")) if response is not None else None
             if length is not None and length != entry.size - done:
                 kind = "too-large" if length > entry.size - done else "http"
                 raise _Discard(kind, "the server offers %d bytes but the pinned model is %d" % (length + done, entry.size))
             started = time.monotonic()
             last_progress = rate_at = alive_at = started
             rate_bytes = done
-            while True:
+            while response is not None:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled()
                 chunk = http.read_chunk(response)
@@ -430,6 +436,22 @@ _CHILDREN = set()
 _CHILDREN_LOCK = threading.Lock()
 
 
+def _tool_name(argv):
+    """The tool in an argv that _nice() may have prefixed with nice/ionice."""
+    skip = 0
+    for item in argv:
+        if skip:
+            skip -= 1
+            continue
+        if item in ("nice", "ionice"):
+            continue
+        if item in ("-n", "-c"):
+            skip = 1
+            continue
+        return os.path.basename(str(item))
+    return os.path.basename(str(argv[0])) if argv else "tool"
+
+
 def _run(argv, errlog, cancel, deadline_seconds):
     """Run a tool in its own process group, registered so a restart can
     reap it, and wait for it under a cancel flag and a wall-clock limit."""
@@ -438,7 +460,7 @@ def _run(argv, errlog, cancel, deadline_seconds):
     with _CHILDREN_LOCK:
         _CHILDREN.add(process)
     try:
-        _wait(process, cancel, time.monotonic() + deadline_seconds)
+        _wait(process, cancel, time.monotonic() + deadline_seconds, _tool_name(argv))
     finally:
         with _CHILDREN_LOCK:
             _CHILDREN.discard(process)
@@ -491,7 +513,7 @@ def convert_to_wav(source, wav_path, cancel=None, deadline_seconds=3600):
     return max(0.0, (size - 44) / 32000.0)
 
 
-def _wait(process, cancel, deadline):
+def _wait(process, cancel, deadline, name="tool"):
     # Polls; never hand the child a PIPE, nothing here drains it.
     while True:
         try:
@@ -504,7 +526,7 @@ def _wait(process, cancel, deadline):
             raise Cancelled()
         if time.monotonic() > deadline:
             _kill_group(process)
-            raise TranscribeError("%s ran past its time limit and was stopped" % os.path.basename(str(process.args[0])))
+            raise TranscribeError("%s ran past its time limit and was stopped" % name)
 
 
 def transcribe_chunk(binary, model_file, wav_path, offset_seconds, duration_seconds, language, gpu, threads,

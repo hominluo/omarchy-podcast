@@ -258,6 +258,24 @@ class ModelDownloadTest(unittest.TestCase):
         ranges = [req[2].get("Range") for req in self.gets()]
         self.assertEqual(ranges, ["bytes=10-", None])
 
+    def test_complete_temp_is_verified_not_refetched(self):
+        # A stop during the hash leaves a full-size temp: hash it, do not download.
+        os.makedirs(self.models_dir)
+        temp = os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.0123456789abcdef.part")
+        with open(temp, "wb") as handle:
+            handle.write(self.BODY)
+        with open(os.path.join(self.models_dir, "ggml-tiny-q5_1.bin.download.json"), "w") as handle:
+            json.dump({"temp": os.path.basename(temp), "size": self.entry.size, "sha256": self.entry.sha256, "revision": "rev"}, handle)
+        self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY)
+        path = whisper.download_model(self.models_dir, "tiny", self.progress)
+        self.assertTrue(whisper.verify_model(path, self.entry))
+        self.assertEqual(self.gets(), [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_tool_name_skips_the_nice_prefix(self):
+        self.assertEqual(whisper._tool_name(["nice", "-n", "19", "ionice", "-c", "3", "/usr/bin/ffmpeg", "-i", "x"]), "ffmpeg")
+        self.assertEqual(whisper._tool_name(["whisper-cli", "-m", "x"]), "whisper-cli")
+
     def test_probe_mismatch_fails_before_transfer(self):
         self.http.add("/rev/ggml-tiny-q5_1.bin", self.BODY, extra_headers={"x-linked-etag": '"' + "0" * 64 + '"'})
         with self.assertRaises(whisper.TranscribeError) as caught:

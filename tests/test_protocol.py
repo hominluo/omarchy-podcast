@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
 
 from engine import PROTOCOL, VERSION, protocol
@@ -292,6 +293,25 @@ class TrustBoundaryTest(unittest.TestCase):
                     reply = await conn.recv()
                     self.assertTrue(reply["ok"], reply)
                     self.assertEqual(oct(os.stat(inside).st_mode & 0o777), "0o600")
+                    # The configured download folder is a permitted root even
+                    # outside home (the Settings button exports there by default).
+                    elsewhere = tempfile.mkdtemp(prefix="omarchy-podcast-dl-")
+                    try:
+                        h.engine.settings.update({"downloadDir": elsewhere})
+                        await conn.send(id=6, cmd="opml-export")
+                        reply = await conn.recv()
+                        self.assertTrue(reply["ok"], reply)
+                        self.assertEqual(os.path.dirname(reply["result"]["path"]), os.path.realpath(elsewhere))
+                    finally:
+                        import shutil
+                        shutil.rmtree(elsewhere, ignore_errors=True)
+                    # A FIFO at the import path must not hang the daemon.
+                    fifo = os.path.join(h.tmp.name, "fifo.opml")
+                    os.mkfifo(fifo)
+                    await conn.send(id=7, cmd="opml-import", path=fifo)
+                    reply = await asyncio.wait_for(conn.recv(), 5)
+                    self.assertFalse(reply["ok"])
+                    self.assertIn("regular file", reply["error"]["message"])
                     # Import refuses anything but a regular file.
                     await conn.send(id=5, cmd="opml-import", path=h.tmp.name)
                     reply = await conn.recv()

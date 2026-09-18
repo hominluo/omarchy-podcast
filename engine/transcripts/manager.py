@@ -43,7 +43,9 @@ class Transcripts:
         self.engine.on_settings_changed(self._on_settings)
         self.engine.on_download_done = self._on_download_done
         self.engine.on_queued = self._on_queued
-        # A run interrupted by a restart is queued again and redone from the start.
+        # A run interrupted by a restart is queued again and redone from the
+        # start; the WAV it was working on is of no use to anyone now.
+        self._sweep_audio()
         self.store.execute("UPDATE transcripts SET status = 'queued' WHERE status = 'partial' AND source = 'whisper'")
         self.store.execute("DELETE FROM transcripts WHERE episode_id NOT IN (SELECT id FROM episodes)")
         for row in self.store.all("SELECT t.episode_id FROM transcripts t JOIN episodes e ON e.id = t.episode_id "
@@ -70,6 +72,22 @@ class Transcripts:
     def _on_settings(self):
         self._model_failures.clear()
         self._detect()
+
+    def _sweep_audio(self):
+        """Remove converted WAVs no run owns: every one is created for a
+        single job and unlinked when it ends, so anything present at
+        start-up was left by a hard stop."""
+        directory = self.engine.paths.audio_dir
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if name.endswith(".wav"):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
 
     def _detect(self):
         self.info = whisper.detect(self.engine.paths.models_dir, self.engine.settings)
