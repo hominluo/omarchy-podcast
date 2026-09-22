@@ -47,6 +47,12 @@ Item {
     extraKeys: function(event) {
       if (event.text === "J") { root.moveCurrent(1); return true }
       if (event.text === "K") { root.moveCurrent(-1); return true }
+      // Shift + arrows move the episode too; checked before the list's own
+      // cursor handling, so a bare Up/Down still just moves the cursor.
+      if (event.modifiers & Qt.ShiftModifier) {
+        if (event.key === Qt.Key_Down) { root.moveCurrent(1); return true }
+        if (event.key === Qt.Key_Up) { root.moveCurrent(-1); return true }
+      }
       if (event.text === "x" && body.current) { service.queueRemove(body.current.id); return true }
       if (event.text === "X" && root.items.length > 0) { root.confirmOpen = true; return true }
       return false

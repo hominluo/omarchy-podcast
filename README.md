@@ -170,9 +170,9 @@ or `A` to play it next), or archive it (`e`); `Q` queues everything and `E`
 archives everything. When you subscribe, only the newest episode lands here —
 the back catalogue stays on the show's own page.
 
-**Up Next** is the queue: reorder with `J` / `K`, remove with `x`, and when an
-episode ends the next one starts. **Downloads** shows what is on disk and
-what is on its way.
+**Up Next** is the queue: reorder with `J` / `K` — or `Shift` with the arrow
+keys — remove with `x`, and when an episode ends the next one starts.
+**Downloads** shows what is on disk and what is on its way.
 
 ## The library
 
@@ -208,8 +208,9 @@ open in your browser only when you click them) and chapters.
 
 On an episode (in a list or in its detail pane): `p` play · `a` add to Up Next
 · `A` play next · `d` download or delete · `m` mark played · `e` archive or
-move to the inbox · `t` transcript. In Up Next `J` / `K` move the episode and
-`x` removes it; in the Inbox `E` archives everything and `Q` queues everything.
+move to the inbox · `t` transcript. In Up Next `J` / `K` — or `Shift` with the
+arrow keys — move the episode and `x` removes it; in the Inbox `E` archives
+everything and `Q` queues everything.
 
 Show notes render as text; links open in your browser only when you click them.
 
