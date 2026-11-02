@@ -109,6 +109,19 @@ class SyncTest(unittest.TestCase):
                 self.assertGreater(h.engine.state["sync"]["lastSyncAt"], 0)
         run(scenario())
 
+    def test_remote_add_logs_are_redacted(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                self._configure(h)
+                self.remote.remote_add = ["http://127.0.0.1:1/feed.xml?token=SUPERSECRET"]
+                with self.assertLogs("podcast.sync", level="INFO") as captured:
+                    result = await h.engine.sync.run()
+                self.assertTrue(result["synced"], result)
+                logged = "\n".join(captured.output)
+                self.assertIn("feed.xml", logged)
+                self.assertNotIn("SUPERSECRET", logged)
+        run(scenario())
+
     def test_older_remote_position_does_not_win(self):
         async def scenario():
             async with EngineHarness(attach) as h:

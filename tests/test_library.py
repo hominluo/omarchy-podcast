@@ -52,6 +52,18 @@ class LibraryTest(unittest.TestCase):
                     self.assertEqual(caught.exception.code, protocol.BAD_REQUEST)
         run(scenario())
 
+    def test_failed_subscribe_redacts_the_query_string(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                url = "http://127.0.0.1:1/feed.xml?token=SUPERSECRET"
+                with self.assertLogs("podcast.library", level="WARNING") as captured:
+                    with self.assertRaises(protocol.ProtocolError):
+                        await h.engine.library.subscribe(url)
+                logged = "\n".join(captured.output)
+                self.assertIn("feed.xml", logged)
+                self.assertNotIn("SUPERSECRET", logged)
+        run(scenario())
+
     def test_subscribe_inbox_and_refresh(self):
         async def scenario():
             async with EngineHarness(attach) as h:

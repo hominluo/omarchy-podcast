@@ -39,7 +39,7 @@ Item {
     switch (view) {
       case "library": return [["Enter", "Open podcast"], ["s", "Unsubscribe"], ["r", "Refresh all feeds"]]
       case "podcast": return [["Enter", "Episode details"], ["p", "Play"], ["a", "Add to Up Next"], ["A", "Play next"], ["d", "Download"], ["m", "Mark played"], ["e", "Archive"], ["t", "Transcript"], ["s", "Unsubscribe"]]
-      case "nowPlaying": return [["n / N", "Next / previous match"], ["Enter", "Seek to segment"], ["f", "Follow the audio again"], ["c", "Chapters"], ["z", "Sleep timer"], ["s / S", "Speed up / down"]]
+      case "nowPlaying": return [["Enter", "Seek to the selected segment"], ["n", "Notes (next match in a transcript)"], ["N", "Previous transcript match"], ["t", "Transcript"], ["f", "Follow the audio again"], ["c", "Chapters"], ["z", "Sleep timer"], ["s / S", "Speed up / down"], ["v", "Voice boost"], ["x", "Skip silence"], ["m", "Mark played"]]
       case "upNext": return [["Enter", "Play"], ["x", "Remove"], ["J / K", "Move down / up"], ["X", "Clear Up Next"]]
       case "inbox": return [["Enter / p", "Play"], ["a", "Add to Up Next"], ["A", "Play next"], ["e", "Archive"], ["E", "Archive all"], ["d", "Download"]]
       case "downloads": return [["x", "Cancel or delete"], ["Enter", "Play"]]

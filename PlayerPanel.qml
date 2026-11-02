@@ -95,12 +95,14 @@ Panel {
   function moveCursor(dy) {
     var sections = visibleSections
     var sIdx = sections.indexOf(focusSection)
+    var next = 0
+    var target = 0
     if (sIdx < 0) { focusSection = sections[0]; selectedIndex = 0; return }
     if (focusSection === "queue") {
-      var next = selectedIndex + dy
+      next = selectedIndex + dy
       if (next >= 0 && next < queueRows.length) { selectedIndex = next; return }
     }
-    var target = sIdx + dy
+    target = sIdx + dy
     if (target < 0 || target >= sections.length) return
     focusSection = sections[target]
     selectedIndex = focusSection === "queue" && dy < 0 ? queueRows.length - 1 : 0
@@ -118,13 +120,14 @@ Panel {
 
   function activateCursor() {
     if (!service) return
+    var row = null
     switch (focusSection) {
       case "hero": if (hasEpisode) root.browse("nowPlaying"); else root.browse("library"); return
       case "seek": service.togglePause(); return
       case "transport": root.runTransport(transportActions[selectedIndex]); return
       case "toggles": root.runToggle(toggleActions[selectedIndex]); return
       case "queue":
-        var row = queueRows[selectedIndex]
+        row = queueRows[selectedIndex]
         if (row) service.play(row.id)
         return
       case "footer": root.runFooter(footerActions[selectedIndex]); return
@@ -245,8 +248,9 @@ Panel {
         else root.moveCursorH(dx)
       }
       onDeleteRequested: {
+        var row = null
         if (root.focusSection === "queue" && root.service) {
-          var row = root.queueRows[root.selectedIndex]
+          row = root.queueRows[root.selectedIndex]
           if (row) root.service.queueRemove(row.id)
         }
       }

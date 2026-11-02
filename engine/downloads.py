@@ -579,17 +579,20 @@ class Downloads:
                 freed += _remove(row["path"])
                 self.store.execute("DELETE FROM downloads WHERE episode_id = ?", (row["episode_id"],))
                 removed.append(row["episode_id"])
-        # Per-podcast cap on kept downloads (oldest played first, then oldest unplayed).
+        # Per-podcast cap on *played* downloads: keepDownloads is how many
+        # listened episodes stay on disk. Unplayed downloads were asked for
+        # (auto-download) and are not culled by this cap. Counting every row
+        # and breaking at the first unplayed one removed played episodes even
+        # when fewer than keepDownloads had been played.
         for podcast in self.store.all("SELECT id FROM podcasts"):
             rows = self.store.all(
-                "SELECT d.episode_id, d.path, e.played FROM downloads d JOIN episodes e ON e.id = d.episode_id "
+                "SELECT d.episode_id, d.path FROM downloads d JOIN episodes e ON e.id = d.episode_id "
                 "LEFT JOIN queue q ON q.episode_id = e.id "
-                "WHERE e.podcast_id = ? AND d.status = 'done' AND d.keep = 1 AND q.episode_id IS NULL ORDER BY e.played DESC, e.pub_date ASC",
+                "WHERE e.podcast_id = ? AND d.status = 'done' AND d.keep = 1 AND e.played = 1 AND q.episode_id IS NULL "
+                "ORDER BY e.pub_date ASC, e.id ASC",
                 (podcast["id"],))
             excess = len(rows) - keep_per
             for row in rows[:max(0, excess)]:
-                if not row["played"]:
-                    break
                 freed += _remove(row["path"])
                 self.store.execute("DELETE FROM downloads WHERE episode_id = ?", (row["episode_id"],))
                 removed.append(row["episode_id"])

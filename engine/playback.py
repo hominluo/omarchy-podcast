@@ -397,6 +397,13 @@ class Playback:
             self._eof_retried_for = None
             if self.sleep["mode"] == "chapter":
                 self.sleep["chapter"] = None
+        # Everything below is entangled with mpv's event stream (start-file
+        # can arrive before the command's reply), so the pointers move first.
+        # Remember them in case loadfile is refused, so the queue entry and
+        # the "last episode" setting can be put back.
+        previous = (self.current_id, self.current_row, self.pos, self.duration,
+                    self._finished_for, self._last_flush_pos,
+                    self.store.get_setting("lastEpisodeId"))
         self.current_id = row["id"]
         self.current_row = row
         self.loaded = False
@@ -406,8 +413,6 @@ class Playback:
         self.duration = float(row["duration"] or 0)
         self._finished_for = None
         self._last_flush_pos = None
-        self.store.set_setting("lastEpisodeId", row["id"])
-        self.engine.queue.remove([row["id"]])
         self.broadcast_now_playing()
         self.broadcast_player(force=True)
         options = {"start": "%.3f" % start, "force-media-title": _media_title(row)}
@@ -419,10 +424,19 @@ class Playback:
             await self.mpv.command("loadfile", source, "replace", -1, options)
             await self.mpv.set_property("pause", False)
         except MpvError as error:
+            (self.current_id, self.current_row, self.pos, self.duration,
+             self._finished_for, self._last_flush_pos, last_id) = previous
+            self.store.set_setting("lastEpisodeId", last_id)
             self.loading_id = None
             self._loading_source = None
             self._expect_stop = False
+            self.broadcast_now_playing()
+            self.broadcast_player(force=True)
             raise protocol.ProtocolError(protocol.UNAVAILABLE, "mpv refused to play: %s" % error)
+        # Only now is it safe to drop it from Up Next: a refused loadfile
+        # leaves the queue exactly as the user arranged it.
+        self.store.set_setting("lastEpisodeId", row["id"])
+        self.engine.queue.remove([row["id"]])
         LOG.info("playing episode %d (%s) from %.0fs %s", row["id"], row["title"][:60], start, "local" if local else "stream")
         artwork = getattr(self.engine, "artwork", None)
         if artwork is not None:

@@ -140,6 +140,36 @@ class BoundsTest(unittest.TestCase):
         self.assertEqual(parsed["podcast"]["title"], "ok")
         self.assertEqual(len(parsed["episodes"]), 1)
 
+    def test_a_utf8_bom_does_not_hide_the_doctype(self):
+        # The BOM is not the first element: the prolog walk has to step over
+        # it, or a DTD behind it would reach the parser.
+        rss = (b'<rss version="2.0"><channel><title>&lol;</title>'
+               b'<link>https://x/</link><description>d</description></channel></rss>')
+        payload = (b'\xef\xbb\xbf<?xml version="1.0"?>'
+                   b'<!DOCTYPE rss [<!ENTITY lol "LOL">]>' + rss)
+        with self.assertRaises(feeds.FeedParseError):
+            feeds.parse(payload, "")
+
+    def test_doctype_after_a_long_prolog_is_rejected(self):
+        # The guard used to look at payload[:65536]; an XML comment longer
+        # than that hid the DTD that followed it and entities were expanded.
+        rss = (b'<rss version="2.0"><channel><title>&lol;</title>'
+               b'<link>https://x/</link><description>d</description></channel></rss>')
+        dtd = b'<!DOCTYPE rss [<!ENTITY lol "LOL">]>'
+        long_comment = b'<!--' + b"x" * 70000 + b"-->"
+        payload = b'<?xml version="1.0"?>' + long_comment + dtd + rss
+        with self.assertRaises(feeds.FeedParseError):
+            feeds.parse(payload, "")
+        # Same length, processing instruction instead of a comment.
+        long_pi = b'<?note ' + b"x" * 70000 + b"?>"
+        with self.assertRaises(feeds.FeedParseError):
+            feeds.parse(long_pi + dtd + rss, "")
+        # A long prolog without a DTD is still a perfectly good feed.
+        plain = (b'<rss version="2.0"><channel><title>ok</title>'
+                 b'<link>https://x/</link><description>d</description></channel></rss>')
+        parsed = feeds.parse(long_comment + plain, "")
+        self.assertEqual(parsed["podcast"]["title"], "ok")
+
     def test_field_and_list_caps(self):
         categories = "".join('<itunes:category text="c%d"/>' % i for i in range(60))
         long_url = "https://x/" + "a" * 3000

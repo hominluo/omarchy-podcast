@@ -114,6 +114,46 @@ class DownloadTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(path))
         run(scenario())
 
+    def test_cleanup_caps_only_played_downloads(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                music = os.path.join(h.tmp.name, "music")
+                os.makedirs(music, exist_ok=True)
+                h.engine.settings.update({"downloadDir": music, "keepDownloads": 5, "deletePlayedAfterDays": 0})
+                podcast = await h.engine.library.subscribe(self.feed_url)
+                paths = []
+                ids = []
+                for i in range(10):
+                    cursor = h.engine.store.execute(
+                        "INSERT INTO episodes (podcast_id, guid, title, pub_date, enclosure_url, first_seen_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (podcast["id"], "cap-%d" % i, "Cap %d" % i, 1000 + i, "https://x/%d.mp3" % i, 1000 + i))
+                    episode_id = cursor.lastrowid
+                    path = os.path.join(music, "cap-%d.mp3" % i)
+                    with open(path, "wb") as handle:
+                        handle.write(b"x")
+                    h.engine.store.execute(
+                        "INSERT INTO downloads (episode_id, status, keep, path, temp_path, bytes_done, bytes_total, "
+                        "attempts, error, created_at) VALUES (?, 'done', 1, ?, '', 1, 1, 0, '', 1)",
+                        (episode_id, path))
+                    ids.append(episode_id)
+                    paths.append(path)
+                # Two played, eight unplayed: the old loop removed both played
+                # files even though keepDownloads=5 was not reached.
+                for i in range(2):
+                    h.engine.store.execute("UPDATE episodes SET played = 1, played_at = ? WHERE id = ?", (2000 + i, ids[i]))
+                self.assertEqual(h.engine.downloads.cleanup()["removed"], 0)
+                self.assertTrue(all(os.path.exists(path) for path in paths))
+                # Seven played: two oldest played files go, unplayed ones stay.
+                for i in range(7):
+                    h.engine.store.execute("UPDATE episodes SET played = 1, played_at = ? WHERE id = ?", (2000 + i, ids[i]))
+                self.assertEqual(h.engine.downloads.cleanup()["removed"], 2)
+                self.assertFalse(os.path.exists(paths[0]))
+                self.assertFalse(os.path.exists(paths[1]))
+                self.assertTrue(os.path.exists(paths[2]))
+                self.assertTrue(os.path.exists(paths[9]))
+        run(scenario())
+
     def test_unclean_shutdown_resumes_downloading_rows(self):
         async def scenario():
             async with EngineHarness(attach) as h:

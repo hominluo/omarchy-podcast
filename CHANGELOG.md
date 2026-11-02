@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.4 — 2026-11-01
+
+Correctness, privacy and security fixes from a full review of the daemon and
+the QML client.
+
+- The DOCTYPE guard walks the XML prolog token by token instead of matching a
+  64 KiB slice, so a long comment or processing instruction can no longer hide
+  a DTD (and its entities) from it. A UTF-8 BOM is stepped over as well.
+- Feed URLs in log messages are redacted (userinfo and query string), so a
+  private feed token is no longer written to the log in clear.
+- A public feed can no longer redirect a fetch to a private address: literal
+  private hosts are refused (loopback stays allowed for local feeds), and a
+  public→private redirect hop is rejected. This covers feeds, enclosures,
+  artwork, chapters and transcript links.
+- `play()` only removes the episode from Up Next and records "last episode"
+  once mpv has accepted `loadfile`; a refused load restores the previous state
+  instead of losing the queue entry.
+- A failed chapters fetch is retried after 15 minutes instead of being cached
+  as an empty list forever. Empty rows written by older releases are retried
+  too.
+- `keepDownloads` caps played downloads only. The old query counted every
+  download and stopped at the first unplayed row, which could remove played
+  episodes even when fewer than the cap had been played.
+- `HTTPError` responses (304, 4xx, 5xx and the `probe_headers` 3xx path) are
+  closed deterministically instead of relying on the garbage collector.
+- The QML lint debt is gone (no block-scoped `var` hoisting, no id shadowing),
+  and the keyboard help matches the implemented keys.
+
 ## 1.0.3 — 2026-09-18
 
 Security hardening after the second marketplace review.

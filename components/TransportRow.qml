@@ -51,9 +51,10 @@ Item {
   function cycleSleep() {
     if (!service || !player) return
     var sleep = player.sleep || { mode: "off" }
+    var left = 0
     if (sleep.mode === "off") { service.setSleepTimer("minutes", sleepDefault); return }
     if (sleep.mode === "minutes") {
-      var left = Math.round(((Number(sleep.endsAt) || 0) * 1000 - Date.now()) / 60000)
+      left = Math.round(((Number(sleep.endsAt) || 0) * 1000 - Date.now()) / 60000)
       if (left < 45) { service.setSleepTimer("minutes", 45); return }
       if (left < 60) { service.setSleepTimer("minutes", 60); return }
       service.setSleepTimer("episode"); return

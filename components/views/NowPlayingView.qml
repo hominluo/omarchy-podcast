@@ -148,9 +148,10 @@ Item {
         textFormat: Text.PlainText
         text: {
           var parts = []
+          var date = ""
           if (service && service.podcastTitle) parts.push(service.podcastTitle)
           if (root.episode) {
-            var date = Model.formatRelativeDate(root.episode.pubDate)
+            date = Model.formatRelativeDate(root.episode.pubDate)
             if (date) parts.push(date)
           }
           return parts.join("  ·  ")

@@ -320,7 +320,7 @@ class Sync:
             try:
                 additions.append(http.check_url(url))
             except http.FetchError as error:
-                LOG.warning("sync: ignoring subscription %r: %s", url[:80], error.message)
+                LOG.warning("sync: ignoring subscription %s: %s", http.redact_url(url), error.message)
         deferred = 0
         for url in additions:
             key = canonical_feed_url(url)
@@ -334,9 +334,9 @@ class Sync:
                 summary = await library.subscribe(url)
                 # A redirect may have stored the feed under another URL.
                 touched.add(canonical_feed_url(summary.get("feedUrl") or url))
-                LOG.info("sync: subscribed to %s", url)
+                LOG.info("sync: subscribed to %s", http.redact_url(url))
             except protocol.ProtocolError as error:
-                LOG.warning("sync: could not subscribe to %s: %s", url, error.message)
+                LOG.warning("sync: could not subscribe to %s: %s", http.redact_url(url), error.message)
         for url in (remote or {}).get("remove", []) or []:
             row = known.get(canonical_feed_url(url))
             if row is None:
@@ -346,7 +346,7 @@ class Sync:
                 continue
             touched.add(canonical_feed_url(row["feed_url"]))
             library.unsubscribe(row["id"], False)
-            LOG.info("sync: unsubscribed from %s", url)
+            LOG.info("sync: unsubscribed from %s", http.redact_url(url))
         # Those came from the server; do not push them back.
         for row in self.store.all("SELECT id, feed_url FROM subscription_changes WHERE synced = 0 AND id > ?", (mark_from,)):
             if canonical_feed_url(row["feed_url"]) in touched:

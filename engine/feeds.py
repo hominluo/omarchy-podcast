@@ -184,15 +184,43 @@ def _small(value, limit=MAX_SMALL):
     return str(value or "").strip()[:limit]
 
 
-_PROLOG_DOCTYPE = re.compile(rb"\A\s*(?:<\?.*?\?>\s*|<!--.*?-->\s*)*<!DOCTYPE", re.S | re.I)
+_DOCTYPE = b"<!doctype"
 
 
 def reject_doctype(payload):
     """Feeds never need a DTD; a document that declares one is refused
     before the parser sees it (entity expansion is the parser's problem
-    otherwise). Only the prolog counts: show notes may quote HTML."""
-    if _PROLOG_DOCTYPE.match(bytes(payload[:65536])):
-        raise FeedParseError("the document declares a DTD, which feeds never need")
+    otherwise). Only the prolog counts: show notes may quote HTML.
+
+    The prolog is walked token by token rather than matched against a fixed
+    window: a comment before the DTD may be arbitrarily long, and slicing at
+    64 KiB used to hide anything that followed it."""
+    data = bytes(payload)
+    pos = 0
+    size = len(data)
+    # A UTF-8 BOM may precede the XML declaration; it is not the first
+    # element, so the prolog walk has to step over it or a DTD behind it
+    # would be missed.
+    if data.startswith(b"\xef\xbb\xbf"):
+        pos = 3
+    while pos < size:
+        while pos < size and data[pos:pos + 1].isspace():
+            pos += 1
+        if data.startswith(b"<!--", pos):
+            end = data.find(b"-->", pos + 4)
+            if end < 0:
+                return                  # unterminated: the parser will say so
+            pos = end + 3
+            continue
+        if data.startswith(b"<?", pos):
+            end = data.find(b"?>", pos + 2)
+            if end < 0:
+                return                  # unterminated: the parser will say so
+            pos = end + 2
+            continue
+        if data[pos:pos + 9].lower() == _DOCTYPE:
+            raise FeedParseError("the document declares a DTD, which feeds never need")
+        return                          # first element (or garbage) ends the prolog
 
 
 def _int(value):

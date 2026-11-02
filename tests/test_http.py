@@ -1,6 +1,8 @@
 import gzip
 import io
 import unittest
+import urllib.error
+import urllib.request
 import zlib
 
 from engine import http
@@ -58,6 +60,86 @@ class ReadCappedTest(unittest.TestCase):
     def test_deflate(self):
         body = zlib.compress(b"D" * 5000)
         self.assertEqual(http._read_capped(_Response(body, {"Content-Encoding": "deflate"}, step=13), 1 << 20), b"D" * 5000)
+
+
+class PrivateRedirectTest(unittest.TestCase):
+    def test_literal_private_targets_are_refused(self):
+        origin = "https://feeds.example.com/show.xml"
+        for target in ("http://127.0.0.1:8080/feed", "http://localhost/feed",
+                       "http://169.254.169.254/latest/meta-data/",
+                       "http://10.0.0.5/feed", "http://192.168.1.5/feed",
+                       "http://[::1]/feed", "http://0.0.0.0/feed"):
+            self.assertTrue(http._private_redirect(origin, target), target)
+
+    def test_public_targets_still_follow(self):
+        self.assertFalse(http._private_redirect("https://feeds.example.com/x", "https://93.184.216.34/y"))
+        # A local feed may redirect to another local address (an SSH tunnel,
+        # a media server, the test harness).
+        self.assertFalse(http._private_redirect("http://127.0.0.1:8080/x", "http://127.0.0.1:9090/y"))
+
+    def test_redirect_handler_refuses_a_private_hop(self):
+        req = urllib.request.Request("https://feeds.example.com/show.xml")
+        with self.assertRaises(http.FetchError) as caught:
+            http._Redirects().redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/feed")
+        self.assertEqual(caught.exception.kind, "bad-url")
+
+    def test_direct_local_subscription_is_still_accepted(self):
+        self.assertEqual(http.check_url("http://127.0.0.1:8080/feed.xml"),
+                         "http://127.0.0.1:8080/feed.xml")
+        self.assertEqual(http.check_url("https://[::1]:8080/feed.xml"),
+                         "https://[::1]:8080/feed.xml")
+
+    def test_literal_private_links_are_refused(self):
+        for url in ("http://169.254.169.254/latest/meta-data/",
+                    "http://10.0.0.5/feed", "http://192.168.1.5/feed",
+                    "http://[fd00::1]/feed", "http://0.0.0.0/feed"):
+            with self.assertRaises(http.FetchError, msg=url) as caught:
+                http.check_url(url)
+            self.assertEqual(caught.exception.kind, "bad-url")
+
+
+class _RaisingOpener:
+    def __init__(self, error):
+        self.error = error
+
+    def open(self, *args, **kwargs):
+        raise self.error
+
+
+class HttpErrorCloseTest(unittest.TestCase):
+    def setUp(self):
+        self.original = http._opener
+
+    def tearDown(self):
+        http._opener = self.original
+
+    def test_fetch_closes_the_error_response(self):
+        body = io.BytesIO(b"error body")
+        error = urllib.error.HTTPError("http://x/feed", 500, "boom", {}, body)
+        http._opener = lambda: _RaisingOpener(error)
+        with self.assertRaises(http.FetchError):
+            http.fetch("http://x/feed")
+        self.assertTrue(body.closed)
+
+    def test_not_modified_closes_the_error_response(self):
+        body = io.BytesIO(b"")
+        error = urllib.error.HTTPError("http://x/feed", 304, "Not Modified", {}, body)
+        http._opener = lambda: _RaisingOpener(error)
+        with self.assertRaises(http.NotModified):
+            http.fetch("http://x/feed")
+        self.assertTrue(body.closed)
+
+    def test_probe_headers_closes_after_a_redirect(self):
+        body = io.BytesIO(b"")
+        error = urllib.error.HTTPError("http://x/model", 302, "Found", {"Location": "http://y/model"}, body)
+        original = http.urllib.request.build_opener
+        http.urllib.request.build_opener = lambda *args, **kwargs: _RaisingOpener(error)
+        try:
+            headers = http.probe_headers("http://x/model")
+        finally:
+            http.urllib.request.build_opener = original
+        self.assertEqual(headers["Location"], "http://y/model")
+        self.assertTrue(body.closed)
 
 
 if __name__ == "__main__":

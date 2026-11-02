@@ -9,6 +9,7 @@ Blocking by design: callers run it in a worker thread.
 
 import http.client
 import io
+import ipaddress
 import socket
 import ssl
 import time
@@ -81,9 +82,57 @@ class Response:
             return self.body.decode(fallback, "replace")
 
 
+def _port(parts):
+    try:
+        return parts.port
+    except ValueError:
+        return None
+
+
+def _private_host(host, port):
+    """True when `host` is (or resolves to) an address outside the public
+    internet. A name that does not resolve is treated as public: the
+    connection will fail on its own."""
+    text = str(host or "").strip("[]")
+    if not text:
+        return True
+    try:
+        return not ipaddress.ip_address(text.split("%", 1)[0]).is_global
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(text, port or 0, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    addresses = []
+    for info in infos:
+        try:
+            addresses.append(ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]))
+        except ValueError:
+            continue
+    return bool(addresses) and any(not address.is_global for address in addresses)
+
+
+def _private_redirect(origin_url, target_url):
+    """True when a redirect would take a public feed onto a private network.
+
+    Direct subscriptions to a local feed are allowed (the user typed that
+    URL); the attack is a remote feed bouncing the fetch to loopback, a LAN
+    address or a cloud metadata endpoint."""
+    try:
+        origin = urllib.parse.urlsplit(origin_url)
+        target = urllib.parse.urlsplit(target_url)
+    except ValueError:
+        return True
+    if _private_host(origin.hostname, _port(origin)):
+        return False
+    return _private_host(target.hostname, _port(target))
+
+
 class _Redirects(urllib.request.HTTPRedirectHandler):
     """Follow a few redirects, only to http(s), never from https down to
-    plain http, and never carry credentials to another host."""
+    plain http, never from a public feed to a private address, and never
+    carry credentials to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urlsplit(newurl)
@@ -95,6 +144,8 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
         origin = urllib.parse.urlsplit(req.full_url)
         if origin.scheme.lower() == "https" and scheme == "http":
             raise FetchError("bad-url", "the server redirected from https to plain http; refusing", status=code)
+        if _private_redirect(req.full_url, newurl):
+            raise FetchError("bad-url", "the server redirected to a private address; refusing", status=code)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
@@ -108,10 +159,22 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
         return new
 
 
+def _literal_address(host):
+    try:
+        return ipaddress.ip_address(str(host or "").strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+
+
 def check_url(url):
     """Validate and normalise a URL for urllib: http(s) only, no control
     characters, and the path/query percent-encoded (feeds ship enclosure
-    URLs with literal spaces, which http.client rejects outright)."""
+    URLs with literal spaces, which http.client rejects outright).
+
+    Literal private addresses are refused, except loopback: a local feed
+    (or the test harness) is a supported thing, a feed pointing downloads
+    at a LAN address or the cloud metadata endpoint is not. Names are left
+    to the redirect check, which resolves them."""
     text = str(url or "").strip()
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         raise FetchError("bad-url", "the link contains control characters")
@@ -123,6 +186,9 @@ def check_url(url):
         raise FetchError("bad-url", "only http and https links can be fetched")
     if any(ch.isspace() for ch in parts.netloc) or not (parts.hostname or ""):
         raise FetchError("bad-url", "the link has no valid host")
+    address = _literal_address(parts.hostname)
+    if address is not None and not address.is_global and not address.is_loopback:
+        raise FetchError("bad-url", "the link points at a private address")
     try:
         parts.port  # raises for a malformed port
     except ValueError:
@@ -165,9 +231,12 @@ def fetch(url, cap=SMALL_CAP, timeout=DEFAULT_TIMEOUT, etag=None, last_modified=
     except FetchError:
         raise
     except urllib.error.HTTPError as error:
-        if error.code == 304:
+        message = _http_message(error)
+        code = error.code
+        error.close()
+        if code == 304:
             raise NotModified()
-        raise FetchError("http", _http_message(error), status=error.code)
+        raise FetchError("http", message, status=code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
     except NETWORK_ERRORS as error:
@@ -270,8 +339,12 @@ def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET"):
         raise
     except urllib.error.HTTPError as error:
         if error.code == 416:
+            error.close()
             raise FetchError("http", "range not satisfiable", status=416)
-        raise FetchError("http", _http_message(error), status=error.code)
+        message = _http_message(error)
+        code = error.code
+        error.close()
+        raise FetchError("http", message, status=code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
     except NETWORK_ERRORS as error:
@@ -307,8 +380,13 @@ def probe_headers(url, timeout=20):
             return response.headers
     except urllib.error.HTTPError as error:
         if 300 <= error.code < 400:
-            return error.headers
-        raise FetchError("http", _http_message(error), status=error.code)
+            headers = error.headers
+            error.close()
+            return headers
+        message = _http_message(error)
+        code = error.code
+        error.close()
+        raise FetchError("http", message, status=code)
     except ssl.SSLError as error:
         raise FetchError("tls", "secure connection failed: %s" % _short(error))
     except NETWORK_ERRORS as error:

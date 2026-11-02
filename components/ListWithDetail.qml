@@ -20,9 +20,9 @@ Item {
   property var extraKeys: null
 
   readonly property var service: browser ? browser.service : null
-  readonly property alias list: list
+  readonly property alias list: episodeList
   readonly property alias detail: detailPane
-  readonly property var current: list.current
+  readonly property var current: episodeList.current
 
   signal activated(var episode)
 
@@ -36,11 +36,11 @@ Item {
     if (browser.pane === "detail" && browser.detailOpen && detailPane.handleKey(event)) return true
     if (extraKeys && extraKeys(event)) return true
     if (browser.pane === "main") {
-      if (list.handleKey(event)) return true
+      if (episodeList.handleKey(event)) return true
       if (event.text === "l" || event.key === Qt.Key_Right) { if (browser.detailOpen) { browser.pane = "detail"; return true } }
       if (event.text === "h" || event.key === Qt.Key_Left) { browser.pane = "sidebar"; return true }
-      if (list.current && event.text !== "" && "paAdmet".indexOf(event.text) !== -1) {
-        if (!detailPane.episode || detailPane.episode.id !== list.current.id) openDetail(list.current)
+      if (episodeList.current && event.text !== "" && "paAdmet".indexOf(event.text) !== -1) {
+        if (!detailPane.episode || detailPane.episode.id !== episodeList.current.id) openDetail(episodeList.current)
         return detailPane.handleKey(event)
       }
     }
@@ -69,7 +69,7 @@ Item {
         }
 
         EpisodeList {
-          id: list
+          id: episodeList
           width: parent.width
           height: parent.height - y
           browser: root.browser
