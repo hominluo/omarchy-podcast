@@ -25,6 +25,17 @@ test("now-playing help matches the keys the view handles", () => {
   assert.match(nowPlaying, /case "n":.*tab = "notes"/)
 })
 
+test("Up Next help advertises the shifted arrows the view handles", () => {
+  const help = read("components/KeyHelp.qml")
+  const view = read("components/views/UpNextView.qml")
+  const table = help.split("\n").find((line) => line.includes('case "upNext"'))
+  assert.ok(table, "KeyHelp has an upNext row")
+  assert.match(table, /Shift \+ ↑ \/ ↓/)
+  assert.match(view, /event\.modifiers & Qt\.ShiftModifier/)
+  assert.match(view, /event\.key === Qt\.Key_Down/)
+  assert.match(view, /event\.key === Qt\.Key_Up/)
+})
+
 test("ListWithDetail does not shadow its list alias with an id", () => {
   const source = read("components/ListWithDetail.qml")
   assert.match(source, /property alias list: episodeList/)
