@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 — 2026-11-01
+
+- Up Next also reorders with `Shift` + the arrow keys, the gesture most list
+  UIs train your hands to expect. `J` / `K` are unchanged, and a bare arrow
+  key still only moves the cursor. (Contributed by @aptaluke, PR #2.)
+- The keyboard help lists the shifted arrows.
+
 ## 1.0.4 — 2026-11-01
 
 Correctness, privacy and security fixes from a full review of the daemon and
