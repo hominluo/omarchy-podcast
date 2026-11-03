@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.podcast",
   "name": "Podcast",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Homin Luo",
   "license": "MIT",
   "homepage": "https://github.com/hominluo/Omarchy-Podcast",
@@ -31,7 +31,7 @@
     "defaultSection": "right",
     "defaults": {
       "showTitle": true,
-      "maxLabelWidth": 160,
+      "maxLabelWidth": 120,
       "barProgress": false,
       "wheelAction": "seek",
       "skipBack": 15,
@@ -71,7 +71,7 @@
         "min": 0,
         "max": 400,
         "step": 10,
-        "defaultValue": 160,
+        "defaultValue": 120,
         "description": "In the shell's spacing units. Longer titles scroll; 0 hides the title and leaves the icon."
       },
       {

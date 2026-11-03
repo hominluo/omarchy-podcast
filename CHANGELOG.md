@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2 — 2026-11-03
+
+- The bar title is shorter by default: `maxLabelWidth` is 120 instead of 160,
+  so a long episode title no longer takes over the bar. It is a setting, and
+  longer titles still scroll; `0` leaves only the glyph.
+
 ## 1.1.1 — 2026-11-03
 
 - Up Next rows show their artwork again. A cached path whose file had gone was

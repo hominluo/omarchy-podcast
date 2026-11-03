@@ -47,7 +47,7 @@ BarWidget {
   readonly property string title: service ? service.title : ""
   readonly property string podcastTitle: service ? service.podcastTitle : ""
   readonly property real progress: player ? Model.progressFraction(player.pos, player.duration) : 0
-  readonly property int maxLabelWidth: Style.space(Number(setting("maxLabelWidth", 160)) || 0)
+  readonly property int maxLabelWidth: Style.space(Number(setting("maxLabelWidth", 120)) || 0)
   readonly property bool showTitle: setting("showTitle", true) === true && maxLabelWidth > 0
   readonly property bool barProgress: setting("barProgress", false) === true
   readonly property string wheelAction: String(setting("wheelAction", "seek"))

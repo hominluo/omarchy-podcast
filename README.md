@@ -287,7 +287,7 @@ or by hand. Keys and defaults:
 | `searchProvider` | `itunes` | `itunes` (no key) or `podcastindex` |
 | `searchCountry` | `auto` | two-letter country for Apple's catalogue; `auto` follows your locale |
 | `syncProvider`, `syncServer`, `syncUsername`, `syncDeviceId`, `syncIntervalMin` | off | see [Sync](#sync); `syncServer` must be `https://` (or `localhost`); the password is entered in the Settings view |
-| `showTitle`, `maxLabelWidth`, `barProgress`, `wheelAction` | `true`, `160`, `false`, `seek` | the bar cell |
+| `showTitle`, `maxLabelWidth`, `barProgress`, `wheelAction` | `true`, `120`, `false`, `seek` | the bar cell |
 
 API keys and the sync password never go into `shell.json`; they are kept in
 `~/.config/omarchy/podcast/credentials.json` (mode 0600).
