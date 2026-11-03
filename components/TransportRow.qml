@@ -26,6 +26,12 @@ Item {
   readonly property var actions: ["back", "playPause", "forward", "speed", "sleep"]
   readonly property int count: actions.length
 
+  // One height for the whole row: five controls of five different heights
+  // read as five separate boxes. The play button is only wider, not taller,
+  // so it stays the centre of the row without breaking the line.
+  readonly property real controlHeight: Style.space(root.large ? 44 : 34)
+  readonly property real playWidth: root.controlHeight + Style.space(root.large ? 14 : 10)
+
   implicitWidth: row.implicitWidth
   implicitHeight: row.implicitHeight
 
@@ -65,7 +71,7 @@ Item {
 
   Row {
     id: row
-    spacing: Style.space(6)
+    spacing: Style.space(root.large ? 10 : 8)
 
     Repeater {
       model: root.actions
@@ -82,9 +88,15 @@ Item {
         hasCursor: root.hasCursor && root.cursorIndex === index
         selected: (isSleep && root.sleeping) || (isSpeed && root.player && Math.abs((root.player.baseSpeed || 1) - 1) > 0.001)
         bordered: true
-        iconSize: isPlay ? (root.large ? Style.font.display : Style.font.iconLarge) : (root.large ? Style.font.iconLarge : Style.font.icon)
-        fontSize: root.large ? Style.font.bodySmall : Style.font.caption
-        horizontalPadding: isPlay ? Style.space(root.large ? 20 : 14) : Style.spacing.controlPaddingX
+        // Square icon buttons, a slightly wider play button, and a width that
+        // still grows when a label needs the room (a custom skip of 45 s, a
+        // speed of 1.25×).
+        height: root.controlHeight
+        width: Math.max(isPlay ? root.playWidth : root.controlHeight, implicitWidth)
+        horizontalPadding: Style.space(root.large ? 14 : 10)
+        verticalPadding: 0
+        iconSize: root.large && isPlay ? Style.font.display : Style.font.iconLarge
+        fontSize: root.large ? Style.font.body : Style.font.bodySmall
         iconText: {
           if (modelData === "back") return root.skipBack === 15 ? "󱥆" : (root.skipBack === 30 ? "󰶖" : "󰑟")
           if (modelData === "forward") return root.skipForward === 30 ? "󰴆" : (root.skipForward === 15 ? "󱤺" : "󰈑")

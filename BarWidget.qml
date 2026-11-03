@@ -151,9 +151,10 @@ BarWidget {
         text: "󰦔"   // nf-md-podcast
         fontFamily: root.fontFamily
         fontSize: Style.bar.iconFont
+        // Full bar foreground in every state: the shell's own widgets dim with
+        // a color, but at bar size any fade reads as a broken glyph next to
+        // its neighbours. Paused is already told by the title disappearing.
         color: root.foreground
-        opacity: root.hasEpisode && !root.playing ? 0.6 : 1.0
-        Behavior on opacity { NumberAnimation { duration: 160 } }
       }
 
       Item {

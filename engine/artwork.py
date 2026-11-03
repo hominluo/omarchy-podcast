@@ -295,6 +295,7 @@ class ArtworkCache:
 
     async def _sweep(self):
         store = self.engine.store
+        self._forget_missing()
         for row in store.all("SELECT id FROM podcasts WHERE image_url != '' AND artwork_path = '' ORDER BY subscribed_at DESC LIMIT 50"):
             await self.ensure_podcast(row["id"])
         rows = store.all(
@@ -308,6 +309,19 @@ class ArtworkCache:
         # Episodes with the same picture as their podcast do not need a copy.
         store.execute("UPDATE episodes SET artwork_path = (SELECT artwork_path FROM podcasts p WHERE p.id = episodes.podcast_id) "
                       "WHERE artwork_path = '' AND image_url != '' AND image_url = (SELECT image_url FROM podcasts p WHERE p.id = episodes.podcast_id)")
+
+    def _forget_missing(self):
+        """Clear rows that still name a file the cache no longer holds.
+
+        `prune` only drops unreferenced files, but a cache wiped or trimmed
+        from outside leaves every row pointing at a path that is gone. Those
+        rows never match the sweep's `artwork_path = ''` filter, so they would
+        stay blank forever; forgetting the path puts them back in the queue."""
+        store = self.engine.store
+        for table in ("podcasts", "episodes"):
+            for row in store.all("SELECT id, artwork_path FROM %s WHERE artwork_path != ''" % table):
+                if not os.path.isfile(row["artwork_path"]):
+                    store.execute("UPDATE %s SET artwork_path = '' WHERE id = ?" % table, (row["id"],))
 
     def prune(self, keep_days=180):
         """Drop cached files nothing references and that are older than

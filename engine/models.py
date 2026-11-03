@@ -42,10 +42,12 @@ def _get(row, key, default=None):
 def artwork_for(row):
     """The local, daemon-produced artwork file for a row, else "". Remote
     URLs never reach the shell: until the cache job has fetched and
-    re-encoded an image, the view shows its placeholder glyph."""
+    re-encoded an image, the view shows its placeholder glyph. A path whose
+    file has since gone is treated as missing, so a pruned cache draws the
+    placeholder instead of a broken image."""
     for key in ("artwork_path", "podcast_artwork_path"):
         value = _get(row, key, "")
-        if value:
+        if value and os.path.isfile(value):
             return value
     return ""
 

@@ -1,12 +1,14 @@
 import asyncio
 import os
 import shutil
+import tempfile
 import unittest
 from unittest import mock
 
-from engine import artwork, protocol
+from engine import artwork, models, protocol
 from engine.artwork import ArtworkCache
 from engine.library import Library
+from engine.store import now
 from tests.fakes import EngineHarness, FakeHttpServer
 
 
@@ -36,6 +38,47 @@ def attach(engine):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+class ArtworkPathTest(unittest.TestCase):
+    """A path is only worth handing to the shell if the file is still there."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.present = os.path.join(self.tmp.name, "cover.jpg")
+        with open(self.present, "wb") as handle:
+            handle.write(b"jpeg")
+        self.gone = os.path.join(self.tmp.name, "gone.jpg")
+
+    def test_missing_file_reads_as_no_artwork(self):
+        self.assertEqual(models.artwork_for({"artwork_path": self.present}), self.present)
+        # The podcast's cover stands in when the episode's own file has gone.
+        self.assertEqual(models.artwork_for({"artwork_path": self.gone,
+                                             "podcast_artwork_path": self.present}), self.present)
+        self.assertEqual(models.artwork_for({"artwork_path": self.gone,
+                                             "podcast_artwork_path": self.gone}), "")
+
+    def test_sweep_forgets_paths_whose_file_vanished(self):
+        async def scenario():
+            async with EngineHarness(attach) as h:
+                store = h.engine.store
+                store.execute("INSERT INTO podcasts (feed_url, title, subscribed_at) VALUES (?, ?, ?)",
+                              ("http://example.test/feed", "Example", now()))
+                podcast_id = store.one("SELECT id FROM podcasts")["id"]
+                store.execute("INSERT INTO episodes (podcast_id, guid, title, enclosure_url, first_seen_at) VALUES (?, ?, ?, ?, ?)",
+                              (podcast_id, "g1", "Episode", "http://example.test/1.mp3", now()))
+                episode_id = store.one("SELECT id FROM episodes")["id"]
+                store.execute("UPDATE podcasts SET artwork_path = ? WHERE id = ?", (self.gone, podcast_id))
+                store.execute("UPDATE episodes SET artwork_path = ? WHERE id = ?", (self.gone, episode_id))
+                h.engine.artwork._forget_missing()
+                self.assertEqual(store.one("SELECT artwork_path FROM podcasts")["artwork_path"], "")
+                self.assertEqual(store.one("SELECT artwork_path FROM episodes")["artwork_path"], "")
+                # A path that still resolves is left alone.
+                store.execute("UPDATE podcasts SET artwork_path = ? WHERE id = ?", (self.present, podcast_id))
+                h.engine.artwork._forget_missing()
+                self.assertEqual(store.one("SELECT artwork_path FROM podcasts")["artwork_path"], self.present)
+        run(scenario())
 
 
 class ArtworkPipelineTest(unittest.TestCase):

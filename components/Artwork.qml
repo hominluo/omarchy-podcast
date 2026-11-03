@@ -66,14 +66,18 @@ Item {
     }
   }
 
-  Text {
+  // OpticalGlyph centres what is painted rather than the text line box, so the
+  // placeholder sits in the middle of the tile at every size instead of
+  // sinking into the bottom edge.
+  OpticalGlyph {
     anchors.centerIn: parent
     visible: !root.ready
-    textFormat: Text.PlainText
+    width: Math.max(1, Math.round(root.glyphSize))
+    height: width
     text: root.glyph
-    color: Qt.darker(root.foreground, 1.4)
-    font.family: Style.font.family
-    font.pixelSize: root.glyphSize
-    renderType: Text.NativeRendering
+    fontFamily: Style.font.family
+    fontSize: Math.max(1, Math.round(root.glyphSize))
+    paintedSize: Math.min(width, height)
+    color: Qt.darker(root.foreground, 1.35)
   }
 }

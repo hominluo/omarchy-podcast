@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.1 — 2026-11-03
+
+- Up Next rows show their artwork again. A cached path whose file had gone was
+  handed to the shell anyway, so those rows drew the placeholder glyph forever
+  while the podcast's own cover sat on disk. Missing files now read as no
+  artwork, and the artwork sweep forgets them so they are fetched again.
+- The bar glyph keeps the bar's text colour in every state. It used to fade to
+  60% while paused, which read as a dimmed or broken icon beside its
+  neighbours.
+- The transport row is one line of controls: equal heights, even spacing, a
+  wider play button, and larger skip glyphs, instead of five boxes of five
+  different sizes.
+- The artwork placeholder is centred by its painted bounds, so it no longer
+  sits against the bottom edge of a tile.
+
 ## 1.1.0 — 2026-11-01
 
 - Up Next also reorders with `Shift` + the arrow keys, the gesture most list
