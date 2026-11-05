@@ -89,44 +89,163 @@ def _port(parts):
         return None
 
 
-def _private_host(host, port):
-    """True when `host` is (or resolves to) an address outside the public
-    internet. A name that does not resolve is treated as public: the
-    connection will fail on its own."""
+def _host_addresses(host, port):
+    """The literal or resolved addresses of `host`; [] when it does not
+    resolve at all."""
     text = str(host or "").strip("[]")
     if not text:
-        return True
+        return []
     try:
-        return not ipaddress.ip_address(text.split("%", 1)[0]).is_global
+        return [ipaddress.ip_address(text.split("%", 1)[0])]
     except ValueError:
         pass
     try:
         infos = socket.getaddrinfo(text, port or 0, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError):
-        return False
+        return []
     addresses = []
     for info in infos:
         try:
             addresses.append(ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]))
         except ValueError:
             continue
+    return addresses
+
+
+def _private_host(host, port):
+    """True when `host` is (or resolves to) an address outside the public
+    internet. A name that does not resolve is treated as public: the
+    connection will fail on its own."""
+    addresses = _host_addresses(host, port)
+    if not str(host or "").strip("[]"):
+        return True
     return bool(addresses) and any(not address.is_global for address in addresses)
 
 
-def _private_redirect(origin_url, target_url):
+def url_is_local(url):
+    """True when `url` points at loopback or another non-public address.
+
+    Callers use this to keep a feed the user typed as the only source
+    allowed to hand out local URLs; a remote feed pointing an artwork or
+    enclosure link at the LAN is a different thing."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return True
+    return _private_host(parts.hostname, _port(parts))
+
+
+def _destination_allowed(host, port, allow_local):
+    """True when every address `host` resolves to is public, or loopback
+    and the caller allows it. An unresolvable name is left to fail on its
+    own; an empty one is refused."""
+    text = str(host or "").strip("[]")
+    if not text:
+        return False
+    addresses = _host_addresses(text, port)
+    if not addresses:
+        return True
+    for address in addresses:
+        if address.is_global:
+            continue
+        if allow_local and address.is_loopback:
+            continue
+        return False
+    return True
+
+
+def _private_redirect(origin_url, target_url, allow_local=True):
     """True when a redirect would take a public feed onto a private network.
 
     Direct subscriptions to a local feed are allowed (the user typed that
     URL); the attack is a remote feed bouncing the fetch to loopback, a LAN
-    address or a cloud metadata endpoint."""
+    address or a cloud metadata endpoint. With allow_local=False the whole
+    chain must stay public, including loopback."""
     try:
         origin = urllib.parse.urlsplit(origin_url)
         target = urllib.parse.urlsplit(target_url)
     except ValueError:
         return True
+    if not allow_local:
+        return not _destination_allowed(target.hostname, _port(target), allow_local=False)
     if _private_host(origin.hostname, _port(origin)):
         return False
     return _private_host(target.hostname, _port(target))
+
+
+def _check_destination(host, port, allow_local):
+    """Resolve `host` before connecting and refuse a private destination.
+
+    First half of the connection-time check: a name must not resolve to
+    loopback, the LAN or a metadata address. The peer address is checked
+    again after connect, which closes the DNS-rebinding window between the
+    two lookups."""
+    if not _destination_allowed(host, port, allow_local):
+        raise FetchError("bad-url", "the link points at a private address")
+
+
+def _check_peer(sock, allow_local):
+    """Second half of the connection-time check: the address the socket
+    actually reached, after DNS has done whatever it is going to do."""
+    try:
+        peer = sock.getpeername()[0]
+    except OSError:
+        return
+    try:
+        address = ipaddress.ip_address(str(peer).split("%", 1)[0])
+    except ValueError:
+        return
+    if address.is_global or (allow_local and address.is_loopback):
+        return
+    raise FetchError("bad-url", "the link connects to a private address")
+
+
+class _CheckedHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection that validates its real destination."""
+
+    def __init__(self, *args, allow_local=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.allow_local = allow_local
+
+    def connect(self):
+        _check_destination(self.host, self.port, self.allow_local)
+        super().connect()
+        try:
+            _check_peer(self.sock, self.allow_local)
+        except BaseException:
+            self.close()
+            raise
+
+
+class _CheckedHTTPSConnection(http.client.HTTPSConnection):
+    """The TLS half of _CheckedHTTPConnection; the peer is checked after
+    the handshake, before any request is written."""
+
+    def __init__(self, *args, allow_local=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.allow_local = allow_local
+
+    def connect(self):
+        _check_destination(self.host, self.port, self.allow_local)
+        super().connect()
+        try:
+            _check_peer(self.sock, self.allow_local)
+        except BaseException:
+            self.close()
+            raise
+
+
+class _CheckedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_CheckedHTTPConnection, req,
+                            allow_local=getattr(req, "allow_local", True))
+
+
+class _CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_CheckedHTTPSConnection, req,
+                            context=self._context,
+                            allow_local=getattr(req, "allow_local", True))
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
@@ -144,11 +263,15 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
         origin = urllib.parse.urlsplit(req.full_url)
         if origin.scheme.lower() == "https" and scheme == "http":
             raise FetchError("bad-url", "the server redirected from https to plain http; refusing", status=code)
-        if _private_redirect(req.full_url, newurl):
+        allow_local = getattr(req, "allow_local", True)
+        if _private_redirect(req.full_url, newurl, allow_local):
             raise FetchError("bad-url", "the server redirected to a private address; refusing", status=code)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
+        # The next hop reuses the same policy: a feed-controlled URL cannot
+        # bounce onto loopback halfway through its redirect chain.
+        new.allow_local = allow_local
         if target.netloc.lower() != origin.netloc.lower():
             for name in list(new.headers.keys()):
                 if name.lower() in SENSITIVE_HEADERS:
@@ -166,15 +289,16 @@ def _literal_address(host):
         return None
 
 
-def check_url(url):
+def check_url(url, allow_local=True):
     """Validate and normalise a URL for urllib: http(s) only, no control
     characters, and the path/query percent-encoded (feeds ship enclosure
     URLs with literal spaces, which http.client rejects outright).
 
-    Literal private addresses are refused, except loopback: a local feed
-    (or the test harness) is a supported thing, a feed pointing downloads
-    at a LAN address or the cloud metadata endpoint is not. Names are left
-    to the redirect check, which resolves them."""
+    Literal private addresses are refused, except loopback when
+    `allow_local` is true: a local feed (or the test harness) is a
+    supported thing, a feed pointing downloads at a LAN address or the
+    cloud metadata endpoint is not. Feed-controlled links pass
+    allow_local=False, and names are resolved at connection time."""
     text = str(url or "").strip()
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         raise FetchError("bad-url", "the link contains control characters")
@@ -187,8 +311,9 @@ def check_url(url):
     if any(ch.isspace() for ch in parts.netloc) or not (parts.hostname or ""):
         raise FetchError("bad-url", "the link has no valid host")
     address = _literal_address(parts.hostname)
-    if address is not None and not address.is_global and not address.is_loopback:
-        raise FetchError("bad-url", "the link points at a private address")
+    if address is not None and not address.is_global:
+        if not (allow_local and address.is_loopback):
+            raise FetchError("bad-url", "the link points at a private address")
     try:
         parts.port  # raises for a malformed port
     except ValueError:
@@ -204,14 +329,18 @@ NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, socket.timeo
 def _opener():
     handler = _Redirects()
     handler.max_redirections = MAX_REDIRECTS
-    return urllib.request.build_opener(handler)
+    return urllib.request.build_opener(_CheckedHTTPHandler(), _CheckedHTTPSHandler(), handler)
 
 
 def fetch(url, cap=SMALL_CAP, timeout=DEFAULT_TIMEOUT, etag=None, last_modified=None,
-          accept="*/*", extra_headers=None, method="GET", data=None):
+          accept="*/*", extra_headers=None, method="GET", data=None, allow_local=True):
     """Fetch `url` into memory (up to `cap` bytes). Raises NotModified on 304,
-    FetchError on anything else that went wrong."""
-    url = check_url(url)
+    FetchError on anything else that went wrong.
+
+    `allow_local` is the trust boundary for feed-supplied URLs: the feed the
+    user typed may live on loopback, but artwork, enclosures and chapters a
+    remote feed names must stay on the public internet."""
+    url = check_url(url, allow_local=allow_local)
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": accept,
@@ -224,6 +353,7 @@ def fetch(url, cap=SMALL_CAP, timeout=DEFAULT_TIMEOUT, etag=None, last_modified=
     if extra_headers:
         headers.update(extra_headers)
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    request.allow_local = allow_local
     try:
         with _opener().open(request, timeout=timeout) as response:
             body = _read_capped(response, cap)
@@ -325,14 +455,15 @@ def _read_capped(response, cap):
     return out.getvalue()
 
 
-def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET"):
+def open_stream(url, timeout=DEFAULT_TIMEOUT, headers=None, method="GET", allow_local=True):
     """Open a streaming response for large bodies (audio, models). The caller
     reads and closes it. Same error mapping as fetch()."""
-    url = check_url(url)
+    url = check_url(url, allow_local=allow_local)
     merged = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
         merged.update(headers)
     request = urllib.request.Request(url, headers=merged, method=method)
+    request.allow_local = allow_local
     try:
         return _opener().open(request, timeout=timeout)
     except FetchError:
@@ -368,15 +499,17 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def probe_headers(url, timeout=20):
+def probe_headers(url, timeout=20, allow_local=True):
     """HEAD `url` and return the first hop's headers without following a
     redirect. Hugging Face, for one, puts the pinned object's size and
     digest on the 302 that sends a client to its CDN; the final response
     no longer carries them."""
-    url = check_url(url)
+    url = check_url(url, allow_local=allow_local)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+    request.allow_local = allow_local
     try:
-        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+        opener = urllib.request.build_opener(_CheckedHTTPHandler(), _CheckedHTTPSHandler(), _NoRedirect())
+        with opener.open(request, timeout=timeout) as response:
             return response.headers
     except urllib.error.HTTPError as error:
         if 300 <= error.code < 400:

@@ -10,6 +10,7 @@ chapter.
 """
 
 import asyncio
+import functools
 import json
 import time
 
@@ -135,17 +136,20 @@ class Chapters:
         failed = self._failed_at.get(episode_id)
         if failed is not None and time.monotonic() - failed < RETRY_SECONDS:
             return
-        row = self.engine.store.one("SELECT chapters_url FROM episodes WHERE id = ?", (int(episode_id),))
+        row = self.engine.store.one(
+            "SELECT e.chapters_url, p.feed_url FROM episodes e JOIN podcasts p ON p.id = e.podcast_id WHERE e.id = ?",
+            (int(episode_id),))
         if row is None or not row["chapters_url"]:
             return
         self._fetching.add(episode_id)
-        asyncio.ensure_future(self._fetch(episode_id, row["chapters_url"]))
+        asyncio.ensure_future(self._fetch(episode_id, row["chapters_url"], http.url_is_local(row["feed_url"])))
 
-    async def _fetch(self, episode_id, url):
+    async def _fetch(self, episode_id, url, allow_local=True):
         try:
             chapters = None
             try:
-                response = await self.engine.run_in_thread(http.fetch, url, http.SMALL_CAP, 20)
+                response = await self.engine.run_in_thread(
+                    functools.partial(http.fetch, url, http.SMALL_CAP, 20, allow_local=allow_local))
                 chapters = parse_json_chapters(response.body)
                 self._failed_at.pop(episode_id, None)
             except http.FetchError as error:

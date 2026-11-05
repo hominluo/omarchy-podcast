@@ -403,6 +403,7 @@ class Downloads:
             "url": row["enclosure_url"], "path": path, "part": part,
             "expected": row["enclosure_length"],
             "validator": (stored["etag"] if stored else None) or (stored["last_modified"] if stored else None),
+            "allow_local": http.url_is_local(row["podcast_feed_url"]),
             "podcast_artwork": row["podcast_artwork_path"], "keep": job.keep,
         }
 
@@ -423,7 +424,8 @@ class Downloads:
             if plan.get("validator"):
                 headers["If-Range"] = plan["validator"]
 
-        response = http.open_stream(url, timeout=30, headers=headers)
+        response = http.open_stream(url, timeout=30, headers=headers,
+                                    allow_local=plan.get("allow_local", True))
         try:
             status = getattr(response, "status", 200)
             total_header = response.headers.get("Content-Length")

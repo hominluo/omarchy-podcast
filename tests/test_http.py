@@ -1,9 +1,12 @@
 import gzip
 import io
+import threading
 import unittest
 import urllib.error
 import urllib.request
 import zlib
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from engine import http
 
@@ -77,6 +80,11 @@ class PrivateRedirectTest(unittest.TestCase):
         # a media server, the test harness).
         self.assertFalse(http._private_redirect("http://127.0.0.1:8080/x", "http://127.0.0.1:9090/y"))
 
+    def test_feed_controlled_redirects_may_not_touch_loopback(self):
+        # The user typed the original feed URL; the feed controls the target.
+        for target in ("http://127.0.0.1:9090/y", "http://localhost/y", "http://192.168.1.5/y"):
+            self.assertTrue(http._private_redirect("http://93.184.216.34/x", target, allow_local=False), target)
+
     def test_redirect_handler_refuses_a_private_hop(self):
         req = urllib.request.Request("https://feeds.example.com/show.xml")
         with self.assertRaises(http.FetchError) as caught:
@@ -89,6 +97,17 @@ class PrivateRedirectTest(unittest.TestCase):
         self.assertEqual(http.check_url("https://[::1]:8080/feed.xml"),
                          "https://[::1]:8080/feed.xml")
 
+    def test_feed_controlled_loopback_is_refused(self):
+        for url in ("http://127.0.0.1:8080/art.jpg", "http://[::1]:8080/art.jpg"):
+            with self.assertRaises(http.FetchError, msg=url) as caught:
+                http.check_url(url, allow_local=False)
+            self.assertEqual(caught.exception.kind, "bad-url")
+
+    def test_url_is_local_separates_feed_origins(self):
+        self.assertTrue(http.url_is_local("http://127.0.0.1:8080/feed.xml"))
+        self.assertTrue(http.url_is_local("http://192.168.1.5/feed.xml"))
+        self.assertFalse(http.url_is_local("https://93.184.216.34/feed.xml"))
+
     def test_literal_private_links_are_refused(self):
         for url in ("http://169.254.169.254/latest/meta-data/",
                     "http://10.0.0.5/feed", "http://192.168.1.5/feed",
@@ -96,6 +115,54 @@ class PrivateRedirectTest(unittest.TestCase):
             with self.assertRaises(http.FetchError, msg=url) as caught:
                 http.check_url(url)
             self.assertEqual(caught.exception.kind, "bad-url")
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class FirstHopTest(unittest.TestCase):
+    """The check the review asked for: feed-controlled first hops, not just
+    redirects. A name is resolved and the peer is the address actually
+    reached, so DNS rebinding cannot slip past a pre-flight lookup."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def test_user_typed_loopback_feed_is_allowed(self):
+        response = http.fetch("http://127.0.0.1:%d/feed" % self.port)
+        self.assertEqual(response.body, b"ok")
+
+    def test_feed_controlled_loopback_literal_is_refused(self):
+        with self.assertRaises(http.FetchError) as caught:
+            http.fetch("http://127.0.0.1:%d/art.jpg" % self.port, allow_local=False)
+        self.assertEqual(caught.exception.kind, "bad-url")
+
+    def test_named_loopback_first_hop_is_resolved_and_refused(self):
+        # `localhost` is not a literal private address at check_url(), so
+        # this exercises the connection-time resolution rather than the
+        # string check.
+        with self.assertRaises(http.FetchError) as caught:
+            http.fetch("http://localhost:%d/art.jpg" % self.port, allow_local=False)
+        self.assertEqual(caught.exception.kind, "bad-url")
 
 
 class _RaisingOpener:

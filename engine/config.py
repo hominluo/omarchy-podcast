@@ -28,7 +28,7 @@ CREDENTIALS_NAME = "credentials.json"
 # runs on a stale copy.
 FALLBACK_DEFAULTS = {
     "showTitle": True,
-    "maxLabelWidth": 160,
+    "maxLabelWidth": 120,
     "barProgress": False,
     "wheelAction": "seek",
     "skipBack": 15,

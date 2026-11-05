@@ -9,6 +9,7 @@ land so the view fills in progressively.
 """
 
 import asyncio
+import functools
 import json
 import os
 import sqlite3
@@ -196,7 +197,9 @@ class Transcripts:
     async def _fetch_feed_transcript(self, row, source):
         url = source["url"]
         try:
-            response = await self.engine.run_in_thread(http.fetch, url, parsers.MAX_BYTES, 30)
+            response = await self.engine.run_in_thread(
+                functools.partial(http.fetch, url, parsers.MAX_BYTES, 30,
+                                   allow_local=http.url_is_local(row["podcast_feed_url"])))
         except http.FetchError as error:
             LOG.info("transcript fetch for episode %d failed: %s", row["id"], error.message)
             return None

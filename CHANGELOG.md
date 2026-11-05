@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.3 — 2026-11-05
+
+- Feed-controlled URLs are checked at connection time, not only on redirects:
+  a remote feed's artwork, enclosure, chapters or transcript link can no
+  longer reach loopback or a LAN address. Names are resolved before the
+  socket is opened and the connected peer is checked again, so a DNS rebind
+  between the two lookups does not get through. A feed the user typed may
+  still be local, and that exception is carried per feed instead of being
+  available to every URL a remote feed names.
+- `maxLabelWidth`'s fallback default now matches the manifest (120), and the
+  engine version matches the manifest again.
+
 ## 1.1.2 — 2026-11-03
 
 - The bar title is shorter by default: `maxLabelWidth` is 120 instead of 160,

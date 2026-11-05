@@ -53,11 +53,12 @@ def _sniff(data):
     return ""
 
 
-def _fetch_image(url):
+def _fetch_image(url, allow_local=True):
     """The bytes of an image, or None. The server's type must be an image
     (or say nothing), and the bytes must look like one."""
     try:
-        response = http.fetch(url, cap=http.ARTWORK_CAP, timeout=20, accept="image/*")
+        response = http.fetch(url, cap=http.ARTWORK_CAP, timeout=20, accept="image/*",
+                              allow_local=allow_local)
     except http.FetchError as error:
         LOG.info("artwork %s: %s", http.redact_url(url), error.message)
         return None
@@ -139,13 +140,13 @@ class ArtworkCache:
     def path_for(self, url):
         return os.path.join(self.dir, key_for(url) + ".jpg")
 
-    def fetch_and_convert(self, url):
+    def fetch_and_convert(self, url, allow_local=True):
         """Blocking. Returns the cached JPEG path, or "" when the image could
         not be fetched or converted."""
         target = self.path_for(url)
         if os.path.isfile(target) and os.path.getsize(target) > 0:
             return target
-        data = _fetch_image(url)
+        data = _fetch_image(url, allow_local)
         if data is None or not _convert(data, self.dir, target, MAX_EDGE):
             return ""
         return target
@@ -196,9 +197,10 @@ class ArtworkCache:
 
     # ---- async API ---------------------------------------------------------
 
-    async def ensure(self, url):
+    async def ensure(self, url, allow_local=True):
         """Cached path for `url`, fetching if needed; concurrent callers for
-        the same URL share one fetch."""
+        the same URL share one fetch. `allow_local` says whether a loopback
+        destination is acceptable: only a feed the user typed gets that."""
         url = str(url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             return ""
@@ -209,13 +211,13 @@ class ArtworkCache:
         if future is None:
             future = self.engine.loop.create_future()
             self._inflight[url] = future
-            asyncio.ensure_future(self._fetch(url, future))
+            asyncio.ensure_future(self._fetch(url, future, allow_local))
         return await future
 
-    async def _fetch(self, url, future):
+    async def _fetch(self, url, future, allow_local):
         try:
             async with self._semaphore:
-                path = await self.engine.run_in_thread(self.fetch_and_convert, url)
+                path = await self.engine.run_in_thread(self.fetch_and_convert, url, allow_local)
         except Exception as error:  # noqa: BLE001
             LOG.exception("artwork fetch failed")
             path = ""
@@ -257,12 +259,13 @@ class ArtworkCache:
             future.set_result(path)
 
     async def ensure_podcast(self, podcast_id):
-        row = self.engine.store.one("SELECT image_url, artwork_path FROM podcasts WHERE id = ?", (int(podcast_id),))
+        row = self.engine.store.one(
+            "SELECT image_url, artwork_path, feed_url FROM podcasts WHERE id = ?", (int(podcast_id),))
         if row is None or not row["image_url"]:
             return ""
         if row["artwork_path"] and os.path.exists(row["artwork_path"]):
             return row["artwork_path"]
-        path = await self.ensure(row["image_url"])
+        path = await self.ensure(row["image_url"], http.url_is_local(row["feed_url"]))
         if path:
             self.engine.store.execute("UPDATE podcasts SET artwork_path = ? WHERE id = ?", (path, int(podcast_id)))
             self.engine.library.broadcast_library()
@@ -272,12 +275,15 @@ class ArtworkCache:
         return path
 
     async def ensure_episode(self, episode_id):
-        row = self.engine.store.one("SELECT image_url, artwork_path FROM episodes WHERE id = ?", (int(episode_id),))
+        row = self.engine.store.one(
+            "SELECT e.image_url, e.artwork_path, p.feed_url AS feed_url "
+            "FROM episodes e JOIN podcasts p ON p.id = e.podcast_id WHERE e.id = ?",
+            (int(episode_id),))
         if row is None or not row["image_url"]:
             return ""
         if row["artwork_path"] and os.path.exists(row["artwork_path"]):
             return row["artwork_path"]
-        path = await self.ensure(row["image_url"])
+        path = await self.ensure(row["image_url"], http.url_is_local(row["feed_url"]))
         if path:
             self.engine.store.execute("UPDATE episodes SET artwork_path = ? WHERE id = ?", (path, int(episode_id)))
             self.engine.library.emit_episode(int(episode_id))
